@@ -25,6 +25,11 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+# local audio + transcripts, not for commit
+*.aac
+*.m4a
+*.wav
+transcripts/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
