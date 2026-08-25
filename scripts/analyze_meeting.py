@@ -75,7 +75,7 @@ def ollama(prompt: str, model: str, host: str, ctx: int) -> str:
             "prompt": prompt,
             "stream": False,
             "think": True,
-            "options": {"num_ctx": ctx, "temperature": 0.2, "num_predict": 2048},
+            "options": {"num_ctx": ctx, "temperature": 0.2, "num_predict": 6000},
         }
     ).encode()
     req = urllib.request.Request(
@@ -99,14 +99,24 @@ def strip_think(answer: str) -> str:
     return answer.strip()
 
 
-def split_summary(md: str) -> tuple[str, str]:
-    """One notes document -> (summary prose, the bullet sections below it).
+def first_heading(template: str) -> str:
+    """The template's own first `## ` heading; what the prose pass fills in.
+
+    Hardcoding "## Summary" here silently collapsed every template that does not
+    have one: no split point, so the whole document counted as prose and the other
+    headings never survived the merge.
+    """
+    return next((l for l in template.splitlines() if l.startswith("## ")), "## Summary")
+
+
+def split_summary(md: str, head: str = "## Summary") -> tuple[str, str]:
+    """One notes document -> (prose under `head`, the bullet sections below it).
 
     Tolerant on purpose. A document with no headings at all is all summary, and any
     heading this script does not know about travels with the bullets, so a model that
     invents a section still cannot make content disappear.
     """
-    _, found, rest = md.partition("## Summary")
+    _, found, rest = md.partition(head)
     if not found:
         return ("", md) if md.lstrip().startswith("## ") else (md.strip(), "")
     body, found, tail = rest.partition("\n## ")
@@ -151,7 +161,9 @@ def main() -> None:
         # A killed run (closed terminal, OOM) shouldn't cost the chunks already paid
         # for. Delete the part file, or the whole -notes dir, to force a redo.
         done = out / f"part-{i:02d}.md"
-        if done.exists() and done.stat().st_size:
+        # .strip(), not st_size: a model that returns nothing still writes a newline,
+        # and a 1-byte part was being reused as if the chunk had been done.
+        if done.exists() and done.read_text().strip():
             print(f"  chunk {i}/{len(parts)} already done, reusing", file=sys.stderr)
             notes.append(done.read_text().strip())
             continue
@@ -172,7 +184,7 @@ def main() -> None:
             f"right beats long and invented. Transcript is machine-made and garbles "
             f"words: passage makes no sense - drop it, never repeat nonsense. Quote "
             f"decisions and action items word for word. Third person. Never 'you' or "
-            f"'I'. Summary always. OPTIONAL section with nothing in it - delete that "
+            f"'I'. {first_heading(template).lstrip('# ')} always. OPTIONAL section with nothing in it - delete that "
             f"heading. Never write 'none'. Never leave an empty heading. Output the "
             f"structure only.",
             args.model,
@@ -184,9 +196,74 @@ def main() -> None:
 
     merged = "\n\n---\n\n".join(notes)
     if len(parts) > 1:
-        merged = merge(notes, template, roster, args)
+        if first_heading(template).lstrip("# ").lower().startswith("summary"):
+            merged = merge(notes, template, roster, args)
+        else:
+            merged = merge_sections(notes, template, roster, args) or merged
     (out / "summary.md").write_text(merged + "\n")
     print(out / "summary.md")
+
+
+def template_headings(template: str) -> list[str]:
+    """The template's `## ` headings, in order."""
+    return [l.rstrip() for l in template.splitlines() if l.startswith("## ")]
+
+
+def sections(md: str, headings: list[str]) -> dict[str, str]:
+    """A notes document -> {template heading: body}.
+
+    Matched on heading text, not level: a model writes `# Check-in (5')` about as
+    often as `##`. A heading the template does not have (the `# Meeting notes` title,
+    an invented `### sub-topic`) stays inside the section it appears in, so nothing
+    is silently dropped.
+    """
+    known = {h.lstrip("# ").strip().lower(): h for h in headings}
+    out: dict[str, list[str]] = {h: [] for h in headings}
+    current = None
+    for line in md.splitlines():
+        m = re.match(r"^#+\s+(.+?)\s*$", line)
+        hit = known.get(m.group(1).strip().lower()) if m else None
+        if hit:
+            current = hit
+        elif current:
+            out[current].append(line)
+    return {h: "\n".join(body).strip() for h, body in out.items()}
+
+
+def merge_sections(notes: list[str], template: str, roster: str, args) -> str:
+    """Merge part notes one section at a time, keeping the template's own structure.
+
+    One small call per section beats one big call: the 4b model loops on a whole
+    transcript, but merging a single section is a few hundred characters of input.
+    """
+    headings = template_headings(template)
+    per_part = [sections(note, headings) for note in notes]
+    comments = sections(template, headings)
+
+    merged = []
+    for h in headings:
+        pieces = [f"PART {i}\n{p[h]}" for i, p in enumerate(per_part, 1) if p.get(h)]
+        if not pieces:
+            continue
+        if len(pieces) == 1:
+            merged.append(f"{h}\n{pieces[0].split(chr(10), 1)[1].strip()}")
+            continue
+        body = ollama(
+            f"--- SECTION \"{h.lstrip('# ')}\" FROM {len(pieces)} PARTS OF ONE MEETING ---\n"
+            + "\n\n".join(pieces)
+            + f"\n--- END ---\n\nMerge these into one section.\n\n{comments[h]}\n\n"
+            f"Rules. {roster}Keep every fact. Never invent one. One bullet per real "
+            f"thing, even when parts word it differently. Drop a bullet that reads as "
+            f"nonsense. Third person. Never 'you' or 'I'. Never write 'none'. Output "
+            f"the section body only, with no heading.",
+            args.model,
+            args.host,
+            args.ctx,
+        )
+        body = re.sub(rf"^#+\s*{re.escape(h.lstrip('# '))}\s*", "", body).strip()
+        if body:
+            merged.append(f"{h}\n{body}")
+    return "\n\n".join(merged).strip()
 
 
 def merge(notes: list[str], template: str, roster: str, args) -> str:
@@ -198,19 +275,20 @@ def merge(notes: list[str], template: str, roster: str, args) -> str:
     rhetorical question straight through to Open questions.
     """
     n = len(notes)
-    split = [split_summary(note) for note in notes]
+    head = first_heading(template)
+    split = [split_summary(note, head) for note in notes]
     summaries = "\n\n".join(f"PART {i}\n{s}" for i, (s, _) in enumerate(split, 1) if s)
     bullets = "\n\n".join(b for _, b in split if b)
 
     # The preamble (language instruction) is above the first heading and matters to
     # both passes; the section comments are what each pass is actually shaped by.
     preamble = template.split("## ", 1)[0].strip()
-    tpl_summary, tpl_bullets = split_summary(template)
+    tpl_summary, tpl_bullets = split_summary(template, head)
 
     narrative = ollama(
         f"--- SUMMARIES FROM {n} PARTS OF ONE MEETING ---\n{summaries}\n--- END ---\n\n"
         f"Write the summary of the whole meeting.\n\n{preamble}\n\n"
-        f"## Summary\n{tpl_summary}\n\n"
+        f"{head}\n{tpl_summary}\n\n"
         # No rule the model can argue with. Told to weigh "two parts on one thread vs
         # one part with two threads" it spent the whole token budget reasoning out
         # loud and never wrote the summary.
@@ -226,7 +304,7 @@ def merge(notes: list[str], template: str, roster: str, args) -> str:
         args.host,
         args.ctx,
     )
-    narrative = re.sub(r"^#+ *Summary\s*", "", narrative).strip()
+    narrative = re.sub(rf"^#+ *{re.escape(head.lstrip('# '))}\s*", "", narrative).strip()
 
     facts = ""
     if bullets:
@@ -252,8 +330,8 @@ def merge(notes: list[str], template: str, roster: str, args) -> str:
             args.ctx,
         )
         # A pass that summarises anyway would duplicate the prose above it.
-        if "## Summary" in facts:
-            facts = split_summary(facts)[1]
+        if head in facts:
+            facts = split_summary(facts, head)[1]
         # The model drops the ## about half the time; a bare "Decisions" line renders
         # as body text and the section stops being a section.
         facts = re.sub(
@@ -263,7 +341,7 @@ def merge(notes: list[str], template: str, roster: str, args) -> str:
             flags=re.M,
         )
 
-    merged = f"## Summary\n{narrative}\n\n{facts}".strip()
+    merged = f"{head}\n{narrative}\n\n{facts}".strip()
     # Both passes empty means the model failed; the raw parts beat an empty file.
     return merged if narrative else "\n\n---\n\n".join(notes)
 
@@ -290,6 +368,18 @@ def selftest() -> None:
     # A model that skips or invents headings must not cost us the content.
     assert split_summary("loose text") == ("loose text", "")
     assert split_summary("## Notes\n- a\n") == ("", "## Notes\n- a\n")
+    assert first_heading("# T\n\n## Check-in (5')\n<!-- x -->\n\n## Events\n") == "## Check-in (5')"
+    assert first_heading("no headings here") == "## Summary"
+    tpl = "# T\n\n## Check-in (5')\n<!-- c -->\n\n## Events (10')\n<!-- e -->\n"
+    assert template_headings(tpl) == ["## Check-in (5')", "## Events (10')"]
+    # Level-tolerant, and an unknown heading stays inside the section it sits in.
+    got = sections("# Meeting notes\n# Check-in (5')\n- a\n### Sub\n- b\n## Events (10')\n- c\n",
+                   ["## Check-in (5')", "## Events (10')"])
+    assert got == {"## Check-in (5')": "- a\n### Sub\n- b", "## Events (10')": "- c"}, got
+    assert split_summary("## Check-in\nprose\n\n## Events\n- a\n", "## Check-in") == (
+        "prose",
+        "## Events\n- a",
+    )
     headed = re.sub(
         r"^(Decisions|Action items|Open questions)\s*$", r"## \1", "Decisions\n- x", flags=re.M
     )
