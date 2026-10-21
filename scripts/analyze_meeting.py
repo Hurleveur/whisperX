@@ -12,6 +12,7 @@ final pass merges them into summary.md following the (optional) template.
 
 import argparse
 import json
+import os
 import pathlib
 import re
 import sys
@@ -93,9 +94,12 @@ def request(prompt: str, args) -> urllib.request.Request:
             "think": True,
             "options": {"num_ctx": args.ctx, "temperature": 0.2, "num_predict": 2048},
         }
-    return urllib.request.Request(
-        url, json.dumps(body).encode(), {"Content-Type": "application/json"}
-    )
+    headers = {"Content-Type": "application/json"}
+    if args.api == "openai" and args.token_file:
+        # hai-context rejects an unauthenticated call. Read here, per request, so the
+        # token never sits on a command line or in an environment variable.
+        headers["Authorization"] = f"Bearer {args.token_file.expanduser().read_text().strip()}"
+    return urllib.request.Request(url, json.dumps(body).encode(), headers)
 
 
 def generate(prompt: str, args) -> str:
@@ -161,6 +165,12 @@ def main() -> None:
     p.add_argument(
         "--host",
         help="default: http://localhost:11434 (ollama) or http://localhost:1234/v1 (openai)",
+    )
+    p.add_argument(
+        "--token-file",
+        type=pathlib.Path,
+        default=os.environ.get("LLM_TOKEN_FILE") or None,
+        help="file holding a bearer token for --api openai (default: $LLM_TOKEN_FILE)",
     )
     args = p.parse_args()
 
@@ -320,7 +330,7 @@ def selftest() -> None:
     # The two backends disagree on url, on where the prompt goes and on where the
     # answer comes back; getting either half crossed sends a valid-looking request
     # nowhere useful.
-    ns = argparse.Namespace(api="ollama", host="http://h", model="m", ctx=99)
+    ns = argparse.Namespace(api="ollama", host="http://h", model="m", ctx=99, token_file=None)
     req = request("p", ns)
     assert req.full_url == "http://h/api/generate"
     assert json.loads(req.data)["prompt"] == "p"
@@ -330,6 +340,13 @@ def selftest() -> None:
     assert req.full_url == "http://h/chat/completions"
     assert json.loads(req.data)["messages"] == [{"role": "user", "content": "p"}]
     assert json.loads(req.data)["max_tokens"] == 2048
+    assert not req.has_header("Authorization")
+    tok = pathlib.Path("/tmp/_m.token")
+    tok.write_text("s3cret\n")
+    ns.token_file = tok
+    assert request("p", ns).get_header("Authorization") == "Bearer s3cret"
+    ns.api = "ollama"  # ollama never gets the token
+    assert not request("p", ns).has_header("Authorization")
     assert strip_think("<think>hmm</think>\n## Summary") == "## Summary"
     assert strip_think("## Summary\n<think>cut off mid-tho") == "## Summary"
     assert strip_think(" plain ") == "plain"
