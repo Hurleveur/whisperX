@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Analyze a meeting transcript with a local Ollama model.
+"""Analyze a meeting transcript with a local LLM: Ollama, or an OpenAI-compatible
+server such as LM Studio.
 
 Long transcripts are cut into chunks; each chunk gets its own notes file, then a
 final pass merges them into summary.md following the (optional) template.
 
     python scripts/analyze_meeting.py transcripts/Tuesday-fr.json -m nemotron-3-nano:4b
     python scripts/analyze_meeting.py notes.txt --template my-structure.md -o out/
+    python scripts/analyze_meeting.py rec.json --api openai -m google/gemma-4-26b-a4b-qat
 """
 
 import argparse
 import json
+import os
 import pathlib
 import re
 import sys
@@ -55,34 +58,61 @@ def chunk(text: str, size: int) -> list[str]:
     return chunks + [current] if current else chunks
 
 
-def ollama(prompt: str, model: str, host: str, ctx: int) -> str:
-    # num_ctx matters: ollama defaults to a small window and truncates the FRONT
-    # of the prompt, which silently eats the instructions.
+def request(prompt: str, args) -> urllib.request.Request:
     # Low temperature because this is extraction, not writing: at the default the
     # model invents attendees who were never there, and spells one name three ways.
-    # num_predict because nothing else stops a loop: a merge once ran 61 minutes on a
-    # 4 KB input. Notes are ~600 words, so 2048 tokens is slack, not a squeeze.
-    # think must be set explicitly. Left unset the model still reasons, but ollama
-    # does not split the trace out: it arrives as plain untagged prose at the top of
-    # response, spending the num_predict budget and truncating the real answer.
-    # Measured on one prompt: unset 78 tokens with the trace inline, false 24 clean,
-    # true 78 with the trace in a separate `thinking` field. True because false cost
-    # the merge its judgement - it deleted a real decision and wrote comma splices -
-    # and the trace stays out of `response` either way, at ~3x the tokens.
-    body = json.dumps(
-        {
-            "model": model,
+    # The output cap because nothing else stops a loop: a merge once ran 61 minutes on
+    # a 4 KB input. 6000, not 2048, because a thinking trace shares the budget: at
+    # 2048 a 9-section answer came back empty.
+    if args.api == "openai":
+        # LM Studio and anything else speaking /v1/chat/completions. The context
+        # window is fixed when the model is loaded, so --ctx has nothing to set here:
+        # load the model with a window that fits --chunk-chars plus the output, or the
+        # server truncates the prompt exactly the way ollama does below.
+        url = f"{args.host}/chat/completions"
+        body = {
+            "model": args.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "temperature": 0.2,
+            "max_tokens": 6000,
+        }
+    else:
+        # num_ctx matters: ollama defaults to a small window and truncates the FRONT
+        # of the prompt, which silently eats the instructions.
+        # think must be set explicitly. Left unset the model still reasons, but ollama
+        # does not split the trace out: it arrives as plain untagged prose at the top of
+        # response, spending the num_predict budget and truncating the real answer.
+        # Measured on one prompt: unset 78 tokens with the trace inline, false 24 clean,
+        # true 78 with the trace in a separate `thinking` field. True because false cost
+        # the merge its judgement - it deleted a real decision and wrote comma splices -
+        # and the trace stays out of `response` either way, at ~3x the tokens.
+        url = f"{args.host}/api/generate"
+        body = {
+            "model": args.model,
             "prompt": prompt,
             "stream": False,
             "think": True,
-            "options": {"num_ctx": ctx, "temperature": 0.2, "num_predict": 6000},
+            "options": {"num_ctx": args.ctx, "temperature": 0.2, "num_predict": 6000},
         }
-    ).encode()
-    req = urllib.request.Request(
-        f"{host}/api/generate", body, {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json"}
+    if args.api == "openai" and args.token_file:
+        # hai-context rejects an unauthenticated call. Read here, per request, so the
+        # token never sits on a command line or in an environment variable.
+        headers["Authorization"] = f"Bearer {args.token_file.expanduser().read_text().strip()}"
+    return urllib.request.Request(url, json.dumps(body).encode(), headers)
+
+
+def generate(prompt: str, args) -> str:
+    with urllib.request.urlopen(request(prompt, args)) as resp:
+        data = json.load(resp)
+    # ollama's `thinking` field, and openai's `reasoning_content`, are both deliberately
+    # ignored: only what the model committed to as the answer is kept.
+    answer = (
+        data["choices"][0]["message"]["content"]
+        if args.api == "openai"
+        else data["response"]
     )
-    with urllib.request.urlopen(req) as resp:
-        answer = json.load(resp)["response"]  # any `thinking` field is deliberately ignored
     return strip_think(answer)
 
 
@@ -126,7 +156,7 @@ def split_summary(md: str, head: str = "## Summary") -> tuple[str, str]:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("transcript", type=pathlib.Path)
-    p.add_argument("-m", "--model", default="nemotron-3-nano:4b")
+    p.add_argument("-m", "--model", help="default: nemotron-3-nano:4b; required with --api openai")
     p.add_argument("-t", "--template", type=pathlib.Path, help="markdown structure to follow")
     p.add_argument("-o", "--out", type=pathlib.Path, help="output dir (default: <transcript>-notes/)")
     p.add_argument(
@@ -136,9 +166,34 @@ def main() -> None:
         help="rename diarization labels: 'SPEAKER_01=Alice,SPEAKER_02=Bob'",
     )
     p.add_argument("-c", "--chunk-chars", type=int, default=12000)
-    p.add_argument("--ctx", type=int, default=16384, help="model context window (num_ctx)")
-    p.add_argument("--host", default="http://localhost:11434")
+    p.add_argument("--ctx", type=int, default=16384, help="model context window (ollama only)")
+    p.add_argument(
+        "--api",
+        choices=("ollama", "openai"),
+        default="ollama",
+        help="ollama's /api/generate, or an OpenAI-compatible /v1 server (LM Studio)",
+    )
+    p.add_argument(
+        "--host",
+        help="default: http://localhost:11434 (ollama) or http://localhost:1234/v1 (openai)",
+    )
+    p.add_argument(
+        "--token-file",
+        type=pathlib.Path,
+        default=os.environ.get("LLM_TOKEN_FILE") or None,
+        help="file holding a bearer token for --api openai (default: $LLM_TOKEN_FILE)",
+    )
     args = p.parse_args()
+
+    if args.api == "openai":
+        args.host = args.host or "http://localhost:1234/v1"
+        # No guessing from /v1/models: it lists everything downloaded, not what is
+        # loaded, so picking one silently runs the wrong model.
+        if not args.model:
+            p.error(f"--api openai needs -m/--model (list them: curl {args.host}/models)")
+    else:
+        args.host = args.host or "http://localhost:11434"
+        args.model = args.model or "nemotron-3-nano:4b"
 
     template = args.template.read_text() if args.template else DEFAULT_TEMPLATE
     out = args.out or args.transcript.with_name(args.transcript.stem + "-notes")
@@ -171,7 +226,7 @@ def main() -> None:
         print(f"  chunk {i}/{len(parts)}...", file=sys.stderr)
         # Instructions repeated after the transcript: last tokens are the ones the
         # model actually follows, and front-truncation can't eat them.
-        answer = ollama(
+        answer = generate(
             f"You take notes for a meeting. Below is part {i} of {len(parts)} of the "
             f"transcript, then the note structure to fill in.\n\n"
             f"--- TRANSCRIPT (part {i}/{len(parts)}) ---\n{part}\n"
@@ -187,9 +242,7 @@ def main() -> None:
             f"'I'. {first_heading(template).lstrip('# ')} always. OPTIONAL section with nothing in it - delete that "
             f"heading. Never write 'none'. Never leave an empty heading. Output the "
             f"structure only.",
-            args.model,
-            args.host,
-            args.ctx,
+            args,
         )
         done.write_text(answer + "\n")
         notes.append(answer)
@@ -248,7 +301,7 @@ def merge_sections(notes: list[str], template: str, roster: str, args) -> str:
         if len(pieces) == 1:
             merged.append(f"{h}\n{pieces[0].split(chr(10), 1)[1].strip()}")
             continue
-        body = ollama(
+        body = generate(
             f"--- SECTION \"{h.lstrip('# ')}\" FROM {len(pieces)} PARTS OF ONE MEETING ---\n"
             + "\n\n".join(pieces)
             + f"\n--- END ---\n\nMerge these into one section.\n\n{comments[h]}\n\n"
@@ -256,9 +309,7 @@ def merge_sections(notes: list[str], template: str, roster: str, args) -> str:
             f"thing, even when parts word it differently. Drop a bullet that reads as "
             f"nonsense. Third person. Never 'you' or 'I'. Never write 'none'. Output "
             f"the section body only, with no heading.",
-            args.model,
-            args.host,
-            args.ctx,
+            args,
         )
         body = re.sub(rf"^#+\s*{re.escape(h.lstrip('# '))}\s*", "", body).strip()
         if body:
@@ -285,7 +336,7 @@ def merge(notes: list[str], template: str, roster: str, args) -> str:
     preamble = template.split("## ", 1)[0].strip()
     tpl_summary, tpl_bullets = split_summary(template, head)
 
-    narrative = ollama(
+    narrative = generate(
         f"--- SUMMARIES FROM {n} PARTS OF ONE MEETING ---\n{summaries}\n--- END ---\n\n"
         f"Write the summary of the whole meeting.\n\n{preamble}\n\n"
         f"{head}\n{tpl_summary}\n\n"
@@ -300,15 +351,13 @@ def merge(notes: list[str], template: str, roster: str, args) -> str:
         f"Blank line between paragraphs. Never one block. Never open a paragraph with "
         f"'The meeting'. Third person. Never 'you' or 'I'. Never pad. No heading.\n\n"
         f"The summary starts on the next line.\n",
-        args.model,
-        args.host,
-        args.ctx,
+        args,
     )
     narrative = re.sub(rf"^#+ *{re.escape(head.lstrip('# '))}\s*", "", narrative).strip()
 
     facts = ""
     if bullets:
-        facts = ollama(
+        facts = generate(
             f"--- DECISIONS, ACTIONS AND QUESTIONS FROM {n} PARTS OF ONE MEETING ---\n"
             f"{bullets}\n--- END ---\n\n"
             f"Merge these into one list.\n\n{preamble}\n\n{tpl_bullets}\n\n"
@@ -325,9 +374,7 @@ def merge(notes: list[str], template: str, roster: str, args) -> str:
             f"person. Never 'you' or 'I'. Section with nothing left - delete that "
             f"heading. Never write 'none'. Output headings and bullets only. No "
             f"summary paragraph.",
-            args.model,
-            args.host,
-            args.ctx,
+            args,
         )
         # A pass that summarises anyway would duplicate the prose above it.
         if head in facts:
@@ -357,6 +404,26 @@ def selftest() -> None:
     tmp.write_text('{"segments":[{"speaker":"S1","text":" hi "},{"text":"ho"}]}')
     assert read_transcript(tmp) == "S1: hi\nUNKNOWN: ho"
     assert read_transcript(tmp, {"S1": "Alice"}) == "Alice: hi\nUNKNOWN: ho"
+    # The two backends disagree on url, on where the prompt goes and on where the
+    # answer comes back; getting either half crossed sends a valid-looking request
+    # nowhere useful.
+    ns = argparse.Namespace(api="ollama", host="http://h", model="m", ctx=99, token_file=None)
+    req = request("p", ns)
+    assert req.full_url == "http://h/api/generate"
+    assert json.loads(req.data)["prompt"] == "p"
+    assert json.loads(req.data)["options"]["num_ctx"] == 99
+    ns.api = "openai"
+    req = request("p", ns)
+    assert req.full_url == "http://h/chat/completions"
+    assert json.loads(req.data)["messages"] == [{"role": "user", "content": "p"}]
+    assert json.loads(req.data)["max_tokens"] == 6000
+    assert not req.has_header("Authorization")
+    tok = pathlib.Path("/tmp/_m.token")
+    tok.write_text("s3cret\n")
+    ns.token_file = tok
+    assert request("p", ns).get_header("Authorization") == "Bearer s3cret"
+    ns.api = "ollama"  # ollama never gets the token
+    assert not request("p", ns).has_header("Authorization")
     assert strip_think("<think>hmm</think>\n## Summary") == "## Summary"
     assert strip_think("## Summary\n<think>cut off mid-tho") == "## Summary"
     assert strip_think(" plain ") == "plain"
