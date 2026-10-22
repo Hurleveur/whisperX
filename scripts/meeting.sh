@@ -29,6 +29,9 @@ Options (must come before the audio file):
 Environment:
   WHISPER_MODEL    whisper model (default: large-v2)
   BATCH_SIZE       whisperX batch size (default: 4; lower it if VRAM is tight)
+  WHISPER_HOTWORDS_FILE  words whisper should expect, such as product and
+                   people names, comma-separated (default:
+                   ~/.local/share/whisperx/hotwords.txt; skipped when absent)
   LLM_API          ollama (default), or openai for LM Studio and other
                    OpenAI-compatible servers
   LLM_HOST         default: localhost:11434 (ollama), localhost:1234/v1 (openai)
@@ -88,6 +91,11 @@ else
     compute=int8
 fi
 
+# Kept out of git: the list names this box's people and projects.
+hotwords_file=${WHISPER_HOTWORDS_FILE:-$HOME/.local/share/whisperx/hotwords.txt}
+hot=()
+if [ -s "$hotwords_file" ]; then hot=(--hotwords "$(tr '\n' ' ' < "$hotwords_file")"); fi
+
 if [ -f "$json" ]; then
     echo "transcript already there, skipping whisperX: $json" >&2
 else
@@ -101,6 +109,7 @@ else
         --compute_type "$compute" \
         --output_dir "$out" \
         --output_format all \
+        ${hot[@]+"${hot[@]}"} \
         "$@"
 fi
 
