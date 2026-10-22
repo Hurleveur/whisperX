@@ -100,6 +100,11 @@ def request(prompt: str, args) -> urllib.request.Request:
         # hai-context rejects an unauthenticated call. Read here, per request, so the
         # token never sits on a command line or in an environment variable.
         headers["Authorization"] = f"Bearer {args.token_file.expanduser().read_text().strip()}"
+    if args.api == "openai" and getattr(args, "escalate", ""):
+        # hai-context's cloud lane: it picks the pinned model for this purpose, meters it
+        # and caps the answer; the `model` in the body is not what answers.
+        headers["x-hai-escalate"] = args.escalate
+        headers["x-hai-escalate-reason"] = "meeting notes from a transcript"
     return urllib.request.Request(url, json.dumps(body).encode(), headers)
 
 
@@ -325,6 +330,11 @@ def main() -> None:
         type=pathlib.Path,
         default=os.environ.get("LLM_TOKEN_FILE") or None,
         help="file holding a bearer token for --api openai (default: $LLM_TOKEN_FILE)",
+    )
+    p.add_argument(
+        "--escalate",
+        default=os.environ.get("LLM_ESCALATE") or "",
+        help="hai-context cloud purpose to draft with, e.g. meeting (default: $LLM_ESCALATE)",
     )
     args = p.parse_args()
 
@@ -582,8 +592,12 @@ def selftest() -> None:
     tok.write_text("s3cret\n")
     ns.token_file = tok
     assert request("p", ns).get_header("Authorization") == "Bearer s3cret"
-    ns.api = "ollama"  # ollama never gets the token
+    assert not request("p", ns).has_header("X-hai-escalate")
+    ns.escalate = "meeting"
+    assert request("p", ns).get_header("X-hai-escalate") == "meeting"
+    ns.api = "ollama"  # ollama never gets the token, nor the cloud lane
     assert not request("p", ns).has_header("Authorization")
+    assert not request("p", ns).has_header("X-hai-escalate")
     assert strip_think("<think>hmm</think>\n## Summary") == "## Summary"
     assert strip_think("## Summary\n<think>cut off mid-tho") == "## Summary"
     assert strip_think(" plain ") == "plain"

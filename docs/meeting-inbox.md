@@ -60,7 +60,12 @@ not checked at all: read the draft as a rough index of the transcript, not as th
 - A Hugging Face token the pyannote diarization models accept, as `HF_TOKEN` in the
   job's environment or in the `huggingface_hub` login cache, with the gated model terms accepted.
 - hai-context running on `127.0.0.1:18701` and a bearer token in `~/.config/hai/tokens/scheduler`
-  (`LLM_TOKEN_FILE` overrides the path). Drafting uses the local model `hai-local` only.
+  (`LLM_TOKEN_FILE` overrides the path). Drafting goes out on hai-context's `meeting` cloud
+  purpose (Gemma 4 31B on a zero-data-retention OpenRouter endpoint, metered under your
+  caps, about $0.02 for an hour of meeting): the transcript leaves the box for that call.
+  `LLM_ESCALATE=` (empty) keeps it on the local model `hai-local` instead.
+- When the job finishes a recording it leaves a quiet row in the cockpit's Activity
+  ("Meeting notes drafted: 10-21-26 11h30"), with no popup on the avatar.
 - `WHISPER_MODEL`, `LLM_API`, `LLM_HOST`, `LLM_MODEL` in the environment override the defaults.
 - Optionally, the names whisper keeps mishearing (people, products, project names),
   comma-separated in `~/.local/share/whisperx/hotwords.txt` (`WHISPER_HOTWORDS_FILE`

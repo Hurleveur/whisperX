@@ -67,6 +67,10 @@ def run_meeting(audio: Path, transcribe_only: bool = False) -> None:
     env.setdefault("LLM_HOST", "http://127.0.0.1:18701/v1")
     env.setdefault("LLM_MODEL", "hai-local")
     env.setdefault("LLM_TOKEN_FILE", str(Path("~/.config/hai/tokens/scheduler").expanduser()))
+    # Drafted on hai-context's `meeting` cloud purpose (a ZDR Gemma, metered under the
+    # owner's caps): the local 4B model invented the claims beside real quotes. Set
+    # LLM_ESCALATE to an empty string to keep the transcript on the box.
+    env.setdefault("LLM_ESCALATE", "meeting")
     flags = ["--transcribe-only"] if transcribe_only else []
     subprocess.run([str(REPO / "scripts" / "meeting.sh"), *flags, str(audio)], env=env, check=True)
 
@@ -109,6 +113,15 @@ def publish(audio: Path, out: Path) -> None:
     tmp.replace(out / "summary.md")
 
 
+def report(line: str) -> None:
+    """One line for the hai-os runner's quiet "finished" notice (`HAI_JOB_REPORT`);
+    nothing when run by hand."""
+    path = os.environ.get("HAI_JOB_REPORT")
+    if path:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+
 def main() -> int:
     root, me = recordings_root(), os.environ.get("HAI_HOSTNAME") or socket.gethostname()
     todo = pending(root, me)
@@ -129,6 +142,7 @@ def main() -> int:
             run_meeting(audio)
             publish(audio, root / me / audio.stem)
             print(f"done: {audio.name}", file=sys.stderr)
+            report(f"Meeting notes drafted: {note_name(audio)}")
         except (subprocess.CalledProcessError, OSError) as exc:
             failed += 1
             print(f"FAILED {audio.name}: {exc}", file=sys.stderr)
@@ -162,7 +176,9 @@ def selftest() -> None:
 
     globals()["run_meeting"] = fake
     os.environ["HAI_RECORDINGS"], os.environ["HAI_HOSTNAME"] = str(root), "me"
+    os.environ["HAI_JOB_REPORT"] = str(tmp / "report.txt")
     assert main() == 1  # bad.wav failed, the other was still done
+    assert (tmp / "report.txt").read_text() == f"Meeting notes drafted: {note_name(root / 'a' / 'm [1].m4a')}\n"
     # Every transcription runs before any draft, and a failed one is not drafted.
     assert calls == ["bad.wav/t", "m [1].m4a/t", "m [1].m4a"], calls
     out = root / "me" / "m [1]"
