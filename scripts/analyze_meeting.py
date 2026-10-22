@@ -130,40 +130,104 @@ def strip_think(answer: str) -> str:
 
 
 QUOTE = re.compile(r'["“«]\s*([^"”»]+?)\s*["”»]')
-# Sections whose bullets claim something was agreed; each must prove it with a quote.
-CHECKED = ("decisions", "action items")
+# Sections whose bullets claim something was said; each must prove it with a quote.
+CHECKED = ("decisions", "action items", "open questions")
+# An action item opens with its owner as a tag: `- #Alice - send the draft - "..."`.
+OWNER = re.compile(r"^\s*[-*]\s+#([\w-]+)")
 
 
 def words(text: str) -> str:
     return " ".join(re.findall(r"\w+", text.lower()))
 
 
-def keep_quoted(md: str, source: str) -> tuple[str, int]:
-    """Drop every Decisions / Action items bullet whose quote is not in `source`.
+def tag(name: str) -> str:
+    """A speaker name as an owner tag spells it: no spaces."""
+    return re.sub(r"\s+", "-", name.strip())
+
+
+def spoken(source: str) -> dict[str, str]:
+    """{lowercased tag: everything that speaker said, as words()}, padded for
+    whole-word search.
+
+    Empty unless every line is `Name: text`, as read_transcript writes a .json: a
+    plain .txt has no speakers to hold an owner to.
+    """
+    lines = [l for l in source.splitlines() if l.strip()]
+    found = [m for l in lines if (m := re.match(r"^([^:\n]{1,40}): (.*)$", l))]
+    if not lines or len(found) < len(lines):
+        return {}
+    out: dict[str, str] = {}
+    for m in found:
+        key = tag(m[1]).lower()
+        out[key] = f"{out.get(key, ' ')}{words(m[2])} "
+    return out
+
+
+def keep_quoted(md: str, source: str) -> tuple[str, list[str]]:
+    """Drop every Decisions / Action items / Open questions bullet whose quote is not
+    in `source`.
 
     The model files suggestions, opinions and its own inferences as decisions, and no
     prompt wording stopped it. A bullet survives only if it carries words of at least
     three tokens, in quotes, that appear verbatim (case and punctuation aside) in the
-    transcript it came from. A heading left with no bullet goes too.
+    transcript it came from, plus at least two words of its own saying what was
+    settled. An action item must also open with a `#Owner` tag, and
+    when the transcript names its speakers the quote must be the owner's own words:
+    the model pinned other people's shrugs ("Je ne sais pas.") on owners as tasks
+    (2026-10-21). A task someone was handed and only answered "ok" to is lost; a wrong
+    owner in the notes is worse. A heading left with no bullet goes too.
     """
-    said = f" {words(source)} "
-    kept, dropped, section = [], 0, None
+    said, voices = f" {words(source)} ", spoken(source)
+    kept, dropped, section, seen = [], [], None, set()
     for line in md.splitlines():
         m = re.match(r"^#+\s+(.+?)\s*$", line)
         if m:
             section = m.group(1).strip().lower()
         elif re.match(r"^\s*[-*]\s", line) and section and section.startswith(CHECKED):
+            where: str | None = said
+            if section.startswith("action items"):
+                owner = OWNER.match(line)
+                where = (voices.get(owner[1].lower()) if voices else said) if owner else None
             quotes = [words(q) for q in QUOTE.findall(line)]
-            if not any(len(q.split()) >= 3 and f" {q} " in said for q in quotes):
-                dropped += 1
+            # The claim itself, outside the quotes: a bare quote ("c'est bien") is a
+            # remark, not a decision (2026-10-22).
+            claim = words(QUOTE.sub(" ", line)).split()
+            # A small model copies the template's `<placeholder>`, and loops: one task
+            # came back 73 times, each with another real line as its quote (2026-10-22).
+            placeholder = re.search(r"<[^>]*>", QUOTE.sub(" ", line))
+            if (len(claim) < 2 or placeholder or (section, *claim) in seen or not where
+                    or not any(len(q.split()) >= 3 and f" {q} " in where for q in quotes)):
+                dropped.append(line.strip())
                 continue
+            seen.add((section, *claim))
         kept.append(line)
     out = "\n".join(kept)
     # A checked heading followed only by blank lines up to the next heading or the end.
-    out = re.sub(
-        r"^#+\s+(?:Decisions|Action items)[^\n]*\n(?:\s*\n)*(?=#|\Z)", "", out, flags=re.M | re.I
-    )
+    names = "|".join(re.escape(c) for c in CHECKED)
+    out = re.sub(rf"^#+\s+(?:{names})[^\n]*(?:\n\s*)*(?=#|\Z)", "", out, flags=re.M | re.I)
     return out.strip(), dropped
+
+
+# Words that say something was agreed, in the languages these meetings are held in.
+# shortcut: French and English only, and a fixed list; make it a setting when a meeting
+# in another language comes through.
+AGREED = re.compile(
+    r"\b(on est d'accord|je suis d'accord|mis d'accord|c'est décidé|on a décidé|we agreed|agreed)\b", re.I
+)
+
+
+def agreements(text: str, before: int = 2) -> str:
+    """A `## Said agreements` section: every transcript line voicing an agreement,
+    with the lines that led to it, verbatim.
+
+    Plain code, so it invents nothing and loses nothing: the model dropped the
+    meeting's one explicit agreement in one draft of two (2026-10-22). A question
+    ("on est d'accord ?") is not an agreement. Empty when nothing matched.
+    """
+    lines = text.splitlines()
+    hits = [i for i, l in enumerate(lines) if AGREED.search(l) and "?" not in l]
+    blocks = ["\n".join(f"> {l}" for l in lines[max(0, i - before): i + 1]) for i in hits]
+    return "## Said agreements\n\n" + "\n\n".join(blocks) if blocks else ""
 
 
 def checked_bullets(notes: list[str]) -> dict[str, list[str]]:
@@ -287,7 +351,11 @@ def main() -> None:
         if names
         else ""
     )
-    parts = chunk(read_transcript(args.transcript, names), args.chunk_chars)
+    text = read_transcript(args.transcript, names)
+    parts = chunk(text, args.chunk_chars)
+    # The tags keep_quoted accepts, so the model writes #Alice and not "Alice:".
+    owners = ", ".join(sorted({f"#{tag(l.split(': ', 1)[0])}" for l in text.splitlines() if spoken(l)}))
+    owners = owners or "#Name"
     print(f"{len(parts)} chunk(s) -> {out}/", file=sys.stderr)
 
     notes = []
@@ -317,17 +385,19 @@ def main() -> None:
             f"Rules. {roster}Only what transcript says. Unsure - leave out. Short and "
             f"right beats long and invented. Transcript is machine-made and garbles "
             f"words: passage makes no sense - drop it, never repeat nonsense. Every "
-            f"decision and action item ends with the speaker's exact words in double "
-            f"quotes, copied from the transcript in its own language. No exact words - "
-            f"no bullet. Third person. Never 'you' or "
+            f"decision, action item and open question ends with the speaker's exact words "
+            f"in double quotes, copied from the transcript in its own language. No exact "
+            f"words - no bullet. Action item starts with the tag of the person who "
+            f"committed ({owners}) and quotes that person. No owner - no bullet. "
+            f"Third person. Never 'you' or "
             f"'I'. {first_heading(template).lstrip('# ')} always. OPTIONAL section with nothing in it - delete that "
             f"heading. Never write 'none'. Never leave an empty heading. Output the "
             f"structure only.",
             args,
         )
         answer, dropped = keep_quoted(answer, part)
-        if dropped:
-            print(f"    dropped {dropped} unquoted decision/action bullet(s)", file=sys.stderr)
+        for line in dropped:
+            print(f"    dropped, quote not found: {line}", file=sys.stderr)
         done.write_text(answer + "\n")
         notes.append(answer)
 
@@ -340,8 +410,9 @@ def main() -> None:
         merged = with_checked(merged, checked_bullets(notes))
     # Again on the whole transcript: a merge pass can reword a quote it was given.
     merged, dropped = keep_quoted(merged, "\n".join(parts))
-    if dropped:
-        print(f"  merge: dropped {dropped} bullet(s) whose quote no longer matched", file=sys.stderr)
+    for line in dropped:
+        print(f"  merge: dropped, quote no longer matched: {line}", file=sys.stderr)
+    merged = "\n\n".join(filter(None, [merged, agreements(text)]))
     (out / "summary.md").write_text(merged + "\n")
     print(out / "summary.md")
 
@@ -540,7 +611,7 @@ def selftest() -> None:
         r"^(Decisions|Action items|Open questions)\s*$", r"## \1", "Decisions\n- x", flags=re.M
     )
     assert headed == "## Decisions\n- x"
-    src = "SPEAKER_00: Bon, on fait des copies pour le collectif.\nSPEAKER_01: Peut-être."
+    src = "SPEAKER_00: Bon, on fait des copies pour le collectif.\nSPEAKER_01: Peut-être. Je ne sais pas."
     notes = (
         "## Summary\nprose \"not checked here\"\n\n## Decisions\n"
         "- Copies go to the collective - \"On fait des copies\"\n"
@@ -549,27 +620,53 @@ def selftest() -> None:
         "## Action items\n- Alex - ships it - \"I will ship\"\n\n## Open questions\n- why?"
     )
     got, n = keep_quoted(notes, src)
-    assert n == 4, n
+    assert len(n) == 5, n
     assert got == (
         "## Summary\nprose \"not checked here\"\n\n## Decisions\n"
-        "- Copies go to the collective - \"On fait des copies\"\n\n## Open questions\n- why?"
+        "- Copies go to the collective - \"On fait des copies\""
     ), got
+    # An action item needs a #Owner, and the quote must be that owner's own words.
+    acts = ("## Action items\n- #SPEAKER_00 - make copies - \"on fait des copies\"\n"
+            "- #SPEAKER_01 - make copies - \"on fait des copies\"\n- make copies - \"on fait des copies\"\n"
+            "- #Nobody - make copies - \"on fait des copies\"\n- #speaker_01 - check it - \"je ne sais pas\"")
+    assert keep_quoted(acts, src) == (
+        "## Action items\n- #SPEAKER_00 - make copies - \"on fait des copies\"\n"
+        "- #speaker_01 - check it - \"je ne sais pas\"", ["- #SPEAKER_01 - make copies - \"on fait des copies\"",
+        "- make copies - \"on fait des copies\"", "- #Nobody - make copies - \"on fait des copies\""]), keep_quoted(acts, src)
+    # No speakers in a plain .txt: the tag is still required, any line may hold the quote.
+    assert len(keep_quoted(acts, "Note: on fait des copies\nfin")[1]) == 2  # untagged, unsaid
+    assert spoken("Jean Paul: Salut toi.") == {"jean-paul": " salut toi "}
+    assert spoken("a: b\nno speaker") == {}
+    assert len(keep_quoted("## Open questions\n- Copies? - \"on fait des copies\"\n- why?", src)[1]) == 2
+    assert keep_quoted("## Open questions\n- Copies or links? - \"on fait des copies\"", src)[1] == []
+    # A quote with no claim of its own beside it says nothing was settled.
+    assert len(keep_quoted("## Decisions\n- \"on fait des copies\"\n- Copies go - \"on fait des copies\"", src)[1]) == 1
     # Curly and French quotes count; a quote spanning a word boundary does not.
-    assert keep_quoted("## Decisions\n- x «on fait des»", src)[1] == 0
-    assert keep_quoted("## Decisions\n- x “ait des copies”", src)[1] == 1
-    parts = ['## Summary\na\n## Decisions\n- Copies - "on fait des copies"\n## Action items\n- A - x - "q one two"',
+    assert len(keep_quoted("## Decisions\n- copies agreed «on fait des»", src)[1]) == 0
+    assert len(keep_quoted("## Decisions\n- copies agreed “ait des copies”", src)[1]) == 1
+    parts = ['## Summary\na\n## Open questions\n- Q - "q three four"\n## Decisions\n- Copies - "on fait des copies"\n'
+             '## Action items\n- A - x - "q one two"',
              '## Summary\nb\n## Decisions\n- Copies again - "On fait des copies."\n- Record - "always do recording"']
     got = checked_bullets(parts)
-    assert got == {"Decisions": ['- Copies - "on fait des copies"', '- Record - "always do recording"'],
+    assert got == {"Open questions": ['- Q - "q three four"'],
+                   "Decisions": ['- Copies - "on fait des copies"', '- Record - "always do recording"'],
                    "Action items": ['- A - x - "q one two"']}, got
-    # The model's merged list is replaced, whatever it reworded or dropped.
+    # The model's merged lists are replaced, whatever it reworded or dropped, and come
+    # back in CHECKED order.
     merged = '## Summary\nab\n\n## Decisions\n- Copies - "we copy"\n\n## Open questions\n- why?'
     assert with_checked(merged, got) == (
         '## Summary\nab\n\n## Decisions\n- Copies - "on fait des copies"\n- Record - "always do recording"'
-        '\n\n## Action items\n- A - x - "q one two"\n\n## Open questions\n- why?'
+        '\n\n## Action items\n- A - x - "q one two"\n\n## Open questions\n- Q - "q three four"'
     ), with_checked(merged, got)
     assert with_checked("## Summary\nab", {}) == "## Summary\nab"
-    assert with_checked("## Summary\nab", got).endswith('## Action items\n- A - x - "q one two"')
+    assert with_checked("## Summary\nab", got).endswith('## Open questions\n- Q - "q three four"')
+    # A looping model's repeats and its copied placeholders go; the first stays.
+    loop = ("## Action items\n- #SPEAKER_00 - make copies - \"on fait des copies\"\n"
+            "- #SPEAKER_00 - make copies - \"bon on fait des copies\"\n- #SPEAKER_00 - <task> - \"on fait des copies\"")
+    assert keep_quoted(loop, src)[0] == "## Action items\n- #SPEAKER_00 - make copies - \"on fait des copies\""
+    talk = "A: on copie ?\nB: oui\nA: Je suis d'accord.\nB: On est d'accord ?\nA: fin"
+    assert agreements(talk) == "## Said agreements\n\n> A: on copie ?\n> B: oui\n> A: Je suis d'accord.", agreements(talk)
+    assert agreements("A: rien") == "" and agreements("A: ok\nB: Agreed.", 5) == "## Said agreements\n\n> A: ok\n> B: Agreed."
     print("ok")
 
 

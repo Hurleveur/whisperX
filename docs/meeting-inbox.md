@@ -42,9 +42,17 @@ does this when the hai-os job runner calls it.
    Exit code 1 and a `FAILED <file>: <reason>` line on stderr mean a file failed; the
    others were still processed. To retry a finished one, delete its output folder.
 
-Decisions and action items in the draft each end with the words that settled them,
-in quotes. `analyze_meeting.py` deletes any such bullet whose quote is not in the
-transcript, so a decision the model inferred never reaches the notes.
+Decisions, action items and open questions in the draft each end with the words that
+settled or raised them, in quotes. `analyze_meeting.py` deletes any such bullet whose
+quote is not in the transcript, so a decision the model inferred never reaches the
+notes. An action item also opens with its owner as a tag (`#Alice`), and the quote must
+be words that owner said; one without an owner, or quoting someone else, is deleted.
+A last section, `Said agreements`, is plain code: every transcript line voicing an
+agreement ("je suis d'accord", "on s'est mis d'accord", "agreed"), with the two lines
+before it, verbatim. It finds what the model loses and invents nothing.
+
+A quote can be real and still not support the claim beside it, and the summary prose is
+not checked at all: read the draft as a rough index of the transcript, not as the record.
 
 ## What the processing box needs
 
@@ -54,3 +62,6 @@ transcript, so a decision the model inferred never reaches the notes.
 - hai-context running on `127.0.0.1:18701` and a bearer token in `~/.config/hai/tokens/scheduler`
   (`LLM_TOKEN_FILE` overrides the path). Drafting uses the local model `hai-local` only.
 - `WHISPER_MODEL`, `LLM_API`, `LLM_HOST`, `LLM_MODEL` in the environment override the defaults.
+- Optionally, the names whisper keeps mishearing (people, products, project names),
+  comma-separated in `~/.local/share/whisperx/hotwords.txt` (`WHISPER_HOTWORDS_FILE`
+  overrides the path). It stays on the box, like the voices.
