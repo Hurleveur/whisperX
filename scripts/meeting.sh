@@ -21,6 +21,9 @@ Options (must come before the audio file):
                    "SPEAKER_01=Alice,SPEAKER_02=Bob". Which label is who is
                    only visible in the transcript, so run once, skim
                    transcripts/<name>.txt, then re-run with the mapping.
+                   Without it, voices enrolled with scripts/voices.py are
+                   recognised and named automatically.
+  --transcribe-only  stop after whisperX, before the LLM draft.
   -h, --help       this message.
 
 Environment:
@@ -51,10 +54,12 @@ if [ $# -eq 0 ]; then usage; fi
 
 copy_to=""
 speakers=""
+transcribe_only=""
 while true; do
     case "${1:-}" in
         --copy-to)  copy_to=${2:?--copy-to needs a directory or .md path}; shift 2 ;;
         --speakers) speakers=${2:?--speakers needs LABEL=Name pairs}; shift 2 ;;
+        --transcribe-only) transcribe_only=1; shift ;;
         -h|--help)  usage 0 ;;
         *) break ;;
     esac
@@ -91,11 +96,20 @@ else
     "$repo/.venv/bin/whisperx" "$audio" \
         --model "${WHISPER_MODEL:-large-v2}" \
         --diarize \
+        --speaker_embeddings \
         --batch_size "${BATCH_SIZE:-4}" \
         --compute_type "$compute" \
         --output_dir "$out" \
         --output_format all \
         "$@"
+fi
+
+if [ -n "$transcribe_only" ]; then echo "$json"; exit 0; fi
+
+# No map given: name whoever voices.py recognises; the rest keep their SPEAKER_NN.
+if [ -z "$speakers" ]; then
+    speakers=$("$repo/.venv/bin/python" "$repo/scripts/voices.py" match "$json")
+    echo "speakers recognised: ${speakers:-none}" >&2
 fi
 
 # if-form again: a false `[ ] && ...` here would abort the script under set -e.

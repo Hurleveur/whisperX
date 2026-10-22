@@ -11,6 +11,7 @@ folder, so Syncthing never has two writers; the inbox files are never touched.
 """
 
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -54,7 +55,7 @@ def pending(root: Path, me: str) -> list[Path]:
     return found
 
 
-def run_meeting(audio: Path) -> None:
+def run_meeting(audio: Path, transcribe_only: bool = False) -> None:
     """meeting.sh does the work and resumes from transcripts/ after a crash."""
     env = {**os.environ}
     # large-v2 is meeting.sh's default; turbo is the speed/accuracy trade for a job
@@ -66,7 +67,20 @@ def run_meeting(audio: Path) -> None:
     env.setdefault("LLM_HOST", "http://127.0.0.1:18701/v1")
     env.setdefault("LLM_MODEL", "hai-local")
     env.setdefault("LLM_TOKEN_FILE", str(Path("~/.config/hai/tokens/scheduler").expanduser()))
-    subprocess.run([str(REPO / "scripts" / "meeting.sh"), str(audio)], env=env, check=True)
+    flags = ["--transcribe-only"] if transcribe_only else []
+    subprocess.run([str(REPO / "scripts" / "meeting.sh"), *flags, str(audio)], env=env, check=True)
+
+
+def note_name(audio: Path) -> str:
+    """`10-21-26 10h30`: the vault's M-DD-YY meeting names, plus the start time so two
+    recordings of one day stay apart. The date in the file name wins; the mtime is
+    when the recording stopped, not when it began."""
+    m = re.search(r"(\d{4})-(\d\d)-(\d\d)[ _T](\d\d)[_:.h-]?(\d\d)", audio.stem)
+    if m:
+        y, mo, d, hh, mm = m.groups()
+    else:
+        y, mo, d, hh, mm = time.strftime("%Y %m %d %H %M", time.localtime(audio.stat().st_mtime)).split()
+    return f"{int(mo)}-{d}-{y[2:]} {hh}h{mm}"
 
 
 def glob_escape(s: str) -> str:
@@ -85,8 +99,9 @@ def publish(audio: Path, out: Path) -> None:
     # Vault first: once summary.md exists the recording is never visited again.
     vault = vault_dir()
     if vault.is_dir():
-        shutil.copy2(draft, vault / f"{stem} draft.md")
-        shutil.copy2(TRANSCRIPTS / f"{stem}.txt", vault / f"{stem} transcript.txt.md")
+        name = note_name(audio)
+        shutil.copy2(draft, vault / f"{name} draft.md")
+        shutil.copy2(TRANSCRIPTS / f"{stem}.txt", vault / f"{name} transcript.md")
     else:
         print(f"no vault folder {vault}, skipping the copy", file=sys.stderr)
     tmp = out / "summary.md.tmp"
@@ -99,6 +114,16 @@ def main() -> int:
     todo = pending(root, me)
     print(f"{len(todo)} recording(s) to do for {me}", file=sys.stderr)
     failed = 0
+    # Every transcript before any draft: the local model holds ~3.4 GB of a 6 GB card
+    # for minutes after a draft, and the next recording's diarization ran out of
+    # memory beside it (2026-10-21).
+    for audio in list(todo):
+        try:
+            run_meeting(audio, transcribe_only=True)
+        except (subprocess.CalledProcessError, OSError) as exc:
+            failed += 1
+            todo.remove(audio)
+            print(f"FAILED {audio.name}: {exc}", file=sys.stderr)
     for audio in todo:
         try:
             run_meeting(audio)
@@ -124,10 +149,12 @@ def selftest() -> None:
     assert [p.name for p in pending(root, "me")] == ["bad.wav", "m [1].m4a"]
     calls = []
 
-    def fake(audio: Path) -> None:
-        calls.append(audio.name)
+    def fake(audio: Path, transcribe_only: bool = False) -> None:
+        calls.append(audio.name + ("/t" if transcribe_only else ""))
         if audio.stem == "bad":
             raise subprocess.CalledProcessError(1, "meeting.sh")
+        if transcribe_only:
+            return
         (TRANSCRIPTS / f"{audio.stem}-notes").mkdir(parents=True, exist_ok=True)
         (TRANSCRIPTS / f"{audio.stem}.json").write_text("{}")
         (TRANSCRIPTS / f"{audio.stem}.txt").write_text("hello")
@@ -136,13 +163,19 @@ def selftest() -> None:
     globals()["run_meeting"] = fake
     os.environ["HAI_RECORDINGS"], os.environ["HAI_HOSTNAME"] = str(root), "me"
     assert main() == 1  # bad.wav failed, the other was still done
+    # Every transcription runs before any draft, and a failed one is not drafted.
+    assert calls == ["bad.wav/t", "m [1].m4a/t", "m [1].m4a"], calls
     out = root / "me" / "m [1]"
     assert (out / "summary.md").read_text() == "draft" and (out / "m [1].txt").exists()
-    assert (tmp / "vault" / "m [1] draft.md").read_text() == "draft"
-    assert (tmp / "vault" / "m [1] transcript.txt.md").read_text() == "hello"
+    # No date in "m [1]": named from the mtime, which the setup pinned to the epoch.
+    epoch = note_name(root / "a" / "m [1].m4a")
+    assert (tmp / "vault" / f"{epoch} draft.md").read_text() == "draft"
+    assert (tmp / "vault" / f"{epoch} transcript.md").read_text() == "hello"
+    assert note_name(Path("Sound record (2026-10-21 10_30_15).m4a")) == "10-21-26 10h30"
+    assert note_name(Path("rec 2026-09-02T08:05.wav")) == "9-02-26 08h05"
     assert not (root / "me" / "bad" / "summary.md").exists()
     calls.clear()
-    assert main() == 1 and calls == ["bad.wav"]  # finished one is skipped, failed one retried
+    assert main() == 1 and calls == ["bad.wav/t"]  # finished one is skipped, failed one retried
     assert (root / "a" / "m [1].m4a").read_bytes() == b"x"  # inbox untouched
     # Own folder is excluded: on the recording box there is nothing to do.
     os.environ["HAI_HOSTNAME"] = "a"

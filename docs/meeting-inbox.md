@@ -14,8 +14,10 @@ does this when the hai-os job runner calls it.
    files (`.json .txt .srt .vtt .tsv`) and `summary.md`, the draft. `summary.md` is
    written last; a folder without it is unfinished and the recording is retried.
    If `$MEETINGS_VAULT_DIR` (default `~/Documents/GitHub/sandbox-office-vault/team/alexandre/meetings`)
-   exists, `<name> draft.md` and `<name> transcript.txt.md` are copied there too.
-4. **Name the speakers and redo the draft.** Read the `.txt`, note which `SPEAKER_NN`
+   exists, `<M-DD-YY> <HH>h<MM> draft.md` and `... transcript.md` are copied there too,
+   dated from the recording's file name (or its modification time).
+4. **Name the speakers and redo the draft.** Voices enrolled earlier are named
+   automatically (step 5). For anyone else, read the `.txt`, note which `SPEAKER_NN`
    is who, then on the processing box, from the whisperX checkout:
 
        rm -r transcripts/<name>-notes
@@ -23,9 +25,26 @@ does this when the hai-os job runner calls it.
 
    The transcript is reused, only the draft is regenerated into `transcripts/`. Copy
    `transcripts/<name>-notes/summary.md` over `recordings/<box>/<name>/summary.md`.
-5. **Run it by hand:** `HAI_RECORDINGS=/path/to/recordings .venv/bin/python scripts/meeting_inbox.py`.
+5. **Enroll a voice once**, from any transcript where you know who `SPEAKER_NN` is,
+   with the person's agreement (a voice embedding identifies them):
+
+       .venv/bin/python scripts/voices.py enroll transcripts/<name>.json SPEAKER_01 Bob
+
+   The voices stay on the box that enrolled them, in `~/.local/share/whisperx/voices`
+   (`VOICES_DIR` to change it), and never sync: enroll on each box that runs the job.
+
+   From then on a label at least `VOICE_THRESHOLD` (default 0.7) similar to an
+   enrolled voice gets that name; `scripts/voices.py match <json>` prints the scores.
+   Enrolling the same person from a second recording adds a sample and helps when the
+   room or microphone differs. Transcripts made before `--speaker_embeddings` was
+   added to meeting.sh carry no embeddings: re-run whisperX on them to enroll.
+6. **Run it by hand:** `HAI_RECORDINGS=/path/to/recordings .venv/bin/python scripts/meeting_inbox.py`.
    Exit code 1 and a `FAILED <file>: <reason>` line on stderr mean a file failed; the
    others were still processed. To retry a finished one, delete its output folder.
+
+Decisions and action items in the draft each end with the words that settled them,
+in quotes. `analyze_meeting.py` deletes any such bullet whose quote is not in the
+transcript, so a decision the model inferred never reaches the notes.
 
 ## What the processing box needs
 
