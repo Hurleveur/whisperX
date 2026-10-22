@@ -129,6 +129,85 @@ def strip_think(answer: str) -> str:
     return answer.strip()
 
 
+QUOTE = re.compile(r'["“«]\s*([^"”»]+?)\s*["”»]')
+# Sections whose bullets claim something was agreed; each must prove it with a quote.
+CHECKED = ("decisions", "action items")
+
+
+def words(text: str) -> str:
+    return " ".join(re.findall(r"\w+", text.lower()))
+
+
+def keep_quoted(md: str, source: str) -> tuple[str, int]:
+    """Drop every Decisions / Action items bullet whose quote is not in `source`.
+
+    The model files suggestions, opinions and its own inferences as decisions, and no
+    prompt wording stopped it. A bullet survives only if it carries words of at least
+    three tokens, in quotes, that appear verbatim (case and punctuation aside) in the
+    transcript it came from. A heading left with no bullet goes too.
+    """
+    said = f" {words(source)} "
+    kept, dropped, section = [], 0, None
+    for line in md.splitlines():
+        m = re.match(r"^#+\s+(.+?)\s*$", line)
+        if m:
+            section = m.group(1).strip().lower()
+        elif re.match(r"^\s*[-*]\s", line) and section and section.startswith(CHECKED):
+            quotes = [words(q) for q in QUOTE.findall(line)]
+            if not any(len(q.split()) >= 3 and f" {q} " in said for q in quotes):
+                dropped += 1
+                continue
+        kept.append(line)
+    out = "\n".join(kept)
+    # A checked heading followed only by blank lines up to the next heading or the end.
+    out = re.sub(
+        r"^#+\s+(?:Decisions|Action items)[^\n]*\n(?:\s*\n)*(?=#|\Z)", "", out, flags=re.M | re.I
+    )
+    return out.strip(), dropped
+
+
+def checked_bullets(notes: list[str]) -> dict[str, list[str]]:
+    """{"Decisions": [...], "Action items": [...]} from every part, deduped by quote.
+
+    Merged by code, not by the model: the merge pass reworded a verbatim quote and
+    keep_quoted then deleted the meeting's one real decision (2026-10-21).
+    """
+    out: dict[str, list[str]] = {}
+    seen: set[str] = set()
+    for note in notes:
+        section = None
+        for line in note.splitlines():
+            m = re.match(r"^#+\s+(.+?)\s*$", line)
+            if m:
+                name = m.group(1).strip()
+                section = name if name.lower().startswith(CHECKED) else None
+            elif section and re.match(r"^\s*[-*]\s", line):
+                key = " | ".join(words(q) for q in QUOTE.findall(line)) or words(line)
+                if key not in seen:
+                    seen.add(key)
+                    out.setdefault(section, []).append(line.rstrip())
+    return out
+
+
+def with_checked(md: str, bullets: dict[str, list[str]]) -> str:
+    """`md` with its Decisions / Action items replaced by `bullets`, placed before
+    Open questions (or at the end)."""
+    kept, skip = [], False
+    for line in md.splitlines():
+        m = re.match(r"^#+\s+(.+?)\s*$", line)
+        if m:
+            skip = m.group(1).strip().lower().startswith(CHECKED)
+        if not skip:
+            kept.append(line)
+    body = "\n".join(kept).strip()
+    order = sorted(bullets, key=lambda h: next(i for i, c in enumerate(CHECKED) if h.lower().startswith(c)))
+    block = "\n\n".join(f"## {h}\n" + "\n".join(bullets[h]) for h in order if bullets[h])
+    if not block:
+        return body
+    head, found, tail = body.partition("## Open questions")
+    return f"{head.rstrip()}\n\n{block}\n\n{found}{tail}".strip() if found else f"{body}\n\n{block}"
+
+
 def first_heading(template: str) -> str:
     """The template's own first `## ` heading; what the prose pass fills in.
 
@@ -237,13 +316,18 @@ def main() -> None:
             # flowing rules, and these are the last tokens before it starts writing.
             f"Rules. {roster}Only what transcript says. Unsure - leave out. Short and "
             f"right beats long and invented. Transcript is machine-made and garbles "
-            f"words: passage makes no sense - drop it, never repeat nonsense. Quote "
-            f"decisions and action items word for word. Third person. Never 'you' or "
+            f"words: passage makes no sense - drop it, never repeat nonsense. Every "
+            f"decision and action item ends with the speaker's exact words in double "
+            f"quotes, copied from the transcript in its own language. No exact words - "
+            f"no bullet. Third person. Never 'you' or "
             f"'I'. {first_heading(template).lstrip('# ')} always. OPTIONAL section with nothing in it - delete that "
             f"heading. Never write 'none'. Never leave an empty heading. Output the "
             f"structure only.",
             args,
         )
+        answer, dropped = keep_quoted(answer, part)
+        if dropped:
+            print(f"    dropped {dropped} unquoted decision/action bullet(s)", file=sys.stderr)
         done.write_text(answer + "\n")
         notes.append(answer)
 
@@ -253,6 +337,11 @@ def main() -> None:
             merged = merge(notes, template, roster, args)
         else:
             merged = merge_sections(notes, template, roster, args) or merged
+        merged = with_checked(merged, checked_bullets(notes))
+    # Again on the whole transcript: a merge pass can reword a quote it was given.
+    merged, dropped = keep_quoted(merged, "\n".join(parts))
+    if dropped:
+        print(f"  merge: dropped {dropped} bullet(s) whose quote no longer matched", file=sys.stderr)
     (out / "summary.md").write_text(merged + "\n")
     print(out / "summary.md")
 
@@ -364,8 +453,8 @@ def merge(notes: list[str], template: str, roster: str, args) -> str:
             # Delete first, merge second. With "merge only, adding a bullet is the
             # worst error" up front the model read the whole job as preservation and
             # filtered nothing - the output was the parts' bullets verbatim.
-            f"Rules. {roster}Keep every decision. Keep every action item. Deleting one "
-            f"is the worst error here. Open questions are different - most of that "
+            f"Rules. {roster}Keep every decision and every action item, each with its "
+            f"quoted words copied unchanged. Deleting one is the worst error here. Open questions are different - most of that "
             f"list does not belong, so cut it hard: question answered during the "
             f"meeting - delete; rhetorical question - delete; procedural chatter - "
             f"delete; question nobody has to act on - delete; bullet that reads as "
@@ -451,6 +540,36 @@ def selftest() -> None:
         r"^(Decisions|Action items|Open questions)\s*$", r"## \1", "Decisions\n- x", flags=re.M
     )
     assert headed == "## Decisions\n- x"
+    src = "SPEAKER_00: Bon, on fait des copies pour le collectif.\nSPEAKER_01: Peut-être."
+    notes = (
+        "## Summary\nprose \"not checked here\"\n\n## Decisions\n"
+        "- Copies go to the collective - \"On fait des copies\"\n"
+        "- Legal counsel per partner - \"we will not assign counsel\"\n"
+        "- Unquoted claim\n- Too short - \"Peut-être\"\n\n"
+        "## Action items\n- Alex - ships it - \"I will ship\"\n\n## Open questions\n- why?"
+    )
+    got, n = keep_quoted(notes, src)
+    assert n == 4, n
+    assert got == (
+        "## Summary\nprose \"not checked here\"\n\n## Decisions\n"
+        "- Copies go to the collective - \"On fait des copies\"\n\n## Open questions\n- why?"
+    ), got
+    # Curly and French quotes count; a quote spanning a word boundary does not.
+    assert keep_quoted("## Decisions\n- x «on fait des»", src)[1] == 0
+    assert keep_quoted("## Decisions\n- x “ait des copies”", src)[1] == 1
+    parts = ['## Summary\na\n## Decisions\n- Copies - "on fait des copies"\n## Action items\n- A - x - "q one two"',
+             '## Summary\nb\n## Decisions\n- Copies again - "On fait des copies."\n- Record - "always do recording"']
+    got = checked_bullets(parts)
+    assert got == {"Decisions": ['- Copies - "on fait des copies"', '- Record - "always do recording"'],
+                   "Action items": ['- A - x - "q one two"']}, got
+    # The model's merged list is replaced, whatever it reworded or dropped.
+    merged = '## Summary\nab\n\n## Decisions\n- Copies - "we copy"\n\n## Open questions\n- why?'
+    assert with_checked(merged, got) == (
+        '## Summary\nab\n\n## Decisions\n- Copies - "on fait des copies"\n- Record - "always do recording"'
+        '\n\n## Action items\n- A - x - "q one two"\n\n## Open questions\n- why?'
+    ), with_checked(merged, got)
+    assert with_checked("## Summary\nab", {}) == "## Summary\nab"
+    assert with_checked("## Summary\nab", got).endswith('## Action items\n- A - x - "q one two"')
     print("ok")
 
 
