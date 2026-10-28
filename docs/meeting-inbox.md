@@ -1,31 +1,55 @@
 # How to get a meeting transcribed and drafted without starting anything
 
-Drop an audio file in your box's recordings folder. Another box that shares the
-folder (over Syncthing) transcribes it and drafts the notes; `scripts/meeting_inbox.py`
-does this when the hai-os job runner calls it.
+Drop an audio file in a meetings folder you chose. The box that watches it transcribes
+it, drafts the notes beside it, and moves the audio out to an archive;
+`scripts/meeting_inbox.py` does this when the hai-os job runner calls it.
 
-1. **Drop the file** in `<hai-os>/.hai-shared/recordings/<your hostname>/`.
-   Accepted: `.m4a .wav .mp3 .ogg .opus .flac .aac`. A file under two minutes old is
-   skipped until the next run, so a recording still being written is left alone.
-2. **Wait.** The job runs on a box whose hostname differs from the folder's: it treats
-   every other host's folder as its inbox and never its own. It runs only while the
-   box is idle and on mains power, and takes up to an hour per recording.
-3. **Find the result** in `recordings/<processing box>/<recording name>/`: the whisperX
-   files (`.json .txt .srt .vtt .tsv`) and `summary.md`, the draft. `summary.md` is
-   written last; a folder without it is unfinished and the recording is retried.
-   If `$MEETINGS_VAULT_DIR` (default `~/Documents/GitHub/sandbox-office-vault/team/alexandre/meetings`)
-   exists, `<M-DD-YY> <HH>h<MM> draft.md` and `... transcript.md` are copied there too,
-   dated from the recording's file name (or its modification time).
-4. **Name the speakers and redo the draft.** Voices enrolled earlier are named
-   automatically (step 5). For anyone else, read the `.txt`, note which `SPEAKER_NN`
+1. **Choose the folder, on one box.** Set `MEETINGS_INBOX` to the folder's path in the
+   job's environment. Under hai-os that is this machine's `background/jobs.local.toml`
+   (gitignored, never synced):
+
+       [jobs.meeting-inbox.env]
+       MEETINGS_INBOX = "~/path/to/the/meetings/folder"
+
+   Unset, the job does nothing. Set it on one box only: a folder shared by sync
+   (Syncthing, a Solid pod) is seen by every box, and two boxes would each take the
+   same recording. The setting is read on every run, so nothing needs restarting.
+2. **Drop the file** in that folder. Accepted: `.m4a .wav .mp3 .mp4 .webm .ogg .opus
+   .flac .aac`. A file under two minutes old is skipped until the next run, so a
+   recording still being written or synced in is left alone.
+3. **Wait.** The job runs only while the box is idle and on mains power, and takes up
+   to an hour per recording.
+4. **Find the result.** `<M-DD-YY> <HH>h<MM> draft.md` and `... transcript.md` appear in
+   the meetings folder, dated from the recording's file name (or its modification
+   time); a name already taken gets a number, so a note is never written over. The
+   audio leaves the folder: it is moved, with the whisperX files (`.json .txt .srt .vtt
+   .tsv`) and `summary.md` (the draft as made), to the archive
+   `$HAI_RECORDINGS/<this box's hostname>/<recording name>/` (default
+   `~/Documents/GitHub/hai-os/.hai-shared/recordings`). A recording still in the folder
+   is unfinished and is retried; one whose archive already holds `summary.md` is only
+   moved, never redrafted.
+
+   **A note already written for that day** (`<M-DD-YY>.md`, the team's own name for a
+   meeting note) is not given a draft beside it: the model reads that note first, then
+   the draft, and writes the note back with what the recording adds. The merge is kept
+   only if every line the team wrote is still there, unchanged and in order, and nobody
+   edited the note while the model ran; the note as it was is copied to the archive
+   first, as `<M-DD-YY> before merge.md`. A merge that fails either check is thrown
+   away and the draft is written beside the note as usual. The model chooses where the
+   additions go (on the first live runs it added a section at the end), and its
+   additions are not checked against the transcript beyond the draft's own quotes:
+   read them as a draft. The merge uses the same model and cloud purpose as the draft,
+   so the team's note leaves the box for that call too.
+5. **Name the speakers and redo the draft.** Voices enrolled earlier are named
+   automatically (step 6). For anyone else, read the `.txt`, note which `SPEAKER_NN`
    is who, then on the processing box, from the whisperX checkout:
 
        rm -r transcripts/<name>-notes
-       scripts/meeting.sh --speakers "SPEAKER_00=Alice,SPEAKER_01=Bob" <the audio file>
+       scripts/meeting.sh --speakers "SPEAKER_00=Alice,SPEAKER_01=Bob" <the archived audio file>
 
    The transcript is reused, only the draft is regenerated into `transcripts/`. Copy
-   `transcripts/<name>-notes/summary.md` over `recordings/<box>/<name>/summary.md`.
-5. **Enroll a voice once**, from any transcript where you know who `SPEAKER_NN` is,
+   `transcripts/<name>-notes/summary.md` over the draft in the meetings folder.
+6. **Enroll a voice once**, from any transcript where you know who `SPEAKER_NN` is,
    with the person's agreement (a voice embedding identifies them):
 
        .venv/bin/python scripts/voices.py enroll transcripts/<name>.json SPEAKER_01 Bob
@@ -38,9 +62,10 @@ does this when the hai-os job runner calls it.
    Enrolling the same person from a second recording adds a sample and helps when the
    room or microphone differs. Transcripts made before `--speaker_embeddings` was
    added to meeting.sh carry no embeddings: re-run whisperX on them to enroll.
-6. **Run it by hand:** `HAI_RECORDINGS=/path/to/recordings .venv/bin/python scripts/meeting_inbox.py`.
+7. **Run it by hand:** `MEETINGS_INBOX=/path/to/meetings .venv/bin/python scripts/meeting_inbox.py`.
    Exit code 1 and a `FAILED <file>: <reason>` line on stderr mean a file failed; the
-   others were still processed. To retry a finished one, delete its output folder.
+   others were still processed. To redo a finished one, move its audio back into the
+   folder and delete its archive folder.
 
 Decisions, action items and open questions in the draft each end with the words that
 settled or raised them, in quotes. `analyze_meeting.py` deletes any such bullet whose

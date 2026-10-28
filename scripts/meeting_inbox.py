@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Turn other boxes' meeting recordings into a transcript and a draft, unattended.
+"""Turn the recordings dropped in a meetings folder into a transcript and a draft, unattended.
 
 Run by the hai-os job runner with no arguments (see docs/meeting-inbox.md). It looks
-in `$HAI_RECORDINGS/<host>/` for every host except this one, runs meeting.sh on each
-recording that has no `summary.md` yet, and writes the results to
-`$HAI_RECORDINGS/<this host>/<recording name>/`. A box only ever writes its own
-folder, so Syncthing never has two writers; the inbox files are never touched.
+for audio in `$MEETINGS_INBOX`, runs meeting.sh on each recording, writes the draft
+and the transcript beside it in that folder, and moves the audio with the whisperX
+files to `$HAI_RECORDINGS/<this host>/<recording name>/`, the archive. With
+`MEETINGS_INBOX` unset it does nothing: the folder is set on the one box that should
+do the work, so two boxes sharing it never both take a recording.
 
     python scripts/meeting_inbox.py --selftest
 """
 
+import argparse
 import os
 import re
 import shutil
@@ -22,7 +24,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 TRANSCRIPTS = REPO / "transcripts"  # where meeting.sh writes
-AUDIO = {".m4a", ".wav", ".mp3", ".ogg", ".opus", ".flac", ".aac"}
+# .mp4 and .webm: what WhatsApp and browsers save a voice recording as.
+AUDIO = {".m4a", ".wav", ".mp3", ".mp4", ".webm", ".ogg", ".opus", ".flac", ".aac"}
 # A file younger than this may still be recording or syncing in.
 MIN_AGE_S = 120
 
@@ -32,31 +35,27 @@ def recordings_root() -> Path:
     return Path(os.environ.get("HAI_RECORDINGS") or default).expanduser()
 
 
-def vault_dir() -> Path:
-    default = "~/Documents/GitHub/sandbox-office-vault/team/alexandre/meetings"
-    return Path(os.environ.get("MEETINGS_VAULT_DIR") or default).expanduser()
+def inbox_dir() -> Path | None:
+    value = os.environ.get("MEETINGS_INBOX")
+    return Path(value).expanduser() if value else None
 
 
-def pending(root: Path, me: str) -> list[Path]:
-    """Audio in every other host's folder whose output has no summary.md yet."""
+def pending(inbox: Path) -> list[Path]:
+    """Audio in the inbox old enough to have finished recording or syncing in."""
     now = time.time()
     found = []
-    hosts = sorted(p for p in root.iterdir() if p.is_dir() and p.name != me) if root.is_dir() else []
-    for host in hosts:
-        for audio in sorted(host.iterdir()):
-            if audio.suffix.lower() not in AUDIO or not audio.is_file():
-                continue
-            if (root / me / audio.stem / "summary.md").exists():
-                continue
-            if now - audio.stat().st_mtime < MIN_AGE_S:
-                print(f"skip, still fresh: {audio.name}", file=sys.stderr)
-                continue
-            found.append(audio)
+    for audio in sorted(inbox.iterdir()) if inbox.is_dir() else []:
+        if audio.suffix.lower() not in AUDIO or not audio.is_file():
+            continue
+        if now - audio.stat().st_mtime < MIN_AGE_S:
+            print(f"skip, still fresh: {audio.name}", file=sys.stderr)
+            continue
+        found.append(audio)
     return found
 
 
-def run_meeting(audio: Path, transcribe_only: bool = False) -> None:
-    """meeting.sh does the work and resumes from transcripts/ after a crash."""
+def llm_env() -> dict[str, str]:
+    """The environment meeting.sh drafts with, which the merge uses too."""
     env = {**os.environ}
     # large-v2 is meeting.sh's default; turbo is the speed/accuracy trade for a job
     # that owns the GPU for the duration.
@@ -71,6 +70,12 @@ def run_meeting(audio: Path, transcribe_only: bool = False) -> None:
     # owner's caps): the local 4B model invented the claims beside real quotes. Set
     # LLM_ESCALATE to an empty string to keep the transcript on the box.
     env.setdefault("LLM_ESCALATE", "meeting")
+    return env
+
+
+def run_meeting(audio: Path, transcribe_only: bool = False) -> None:
+    """meeting.sh does the work and resumes from transcripts/ after a crash."""
+    env = llm_env()
     flags = ["--transcribe-only"] if transcribe_only else []
     subprocess.run([str(REPO / "scripts" / "meeting.sh"), *flags, str(audio)], env=env, check=True)
 
@@ -87,12 +92,81 @@ def note_name(audio: Path) -> str:
     return f"{int(mo)}-{d}-{y[2:]} {hh}h{mm}"
 
 
+def merge_note(note: str, draft: str) -> str:
+    """The team's note for that day with the recording's draft worked in, by the model."""
+    import analyze_meeting  # beside this script; only a merge needs it
+
+    env = llm_env()
+    args = argparse.Namespace(
+        api=env["LLM_API"], host=env["LLM_HOST"], model=env["LLM_MODEL"], ctx=32768,
+        token_file=Path(env["LLM_TOKEN_FILE"]) if env.get("LLM_TOKEN_FILE") else None,
+        escalate=env.get("LLM_ESCALATE", ""),
+    )
+    # The note before the draft: the model reads what the team already wrote, its
+    # headings and its people, before it sees what to add.
+    answer = analyze_meeting.generate(
+        "You keep a team's meeting note. Below is the note the team wrote, then notes "
+        "drafted by a machine from a recording of that day's meeting.\n\n"
+        f"--- TEAM NOTE ---\n{note}\n--- END TEAM NOTE ---\n\n"
+        f"--- DRAFT FROM THE RECORDING ---\n{draft}\n--- END DRAFT ---\n\n"
+        "Rules. Read the team note first: its headings, its people, what it already says. "
+        "Output the whole team note with what the draft adds worked in where it belongs. "
+        "Copy every line of the team note exactly, in its order. Never reword, move or "
+        "delete one. Add only what the draft says and the note does not. Already in the "
+        "note - skip. Keep the draft's quotes exactly. Write additions in the note's "
+        "language. Output the note only.",
+        args,
+    )
+    return strip_markers(answer)
+
+
+#: The prompt's own fences, which the model echoes back (seen live, 2026-10-28).
+MARKERS = re.compile(r"^--- (END )?(TEAM NOTE|DRAFT FROM THE RECORDING) ---[ \t]*\n?", re.MULTILINE)
+
+
+def strip_markers(answer: str) -> str:
+    return MARKERS.sub("", answer)
+
+
+def kept_whole(note: str, merged: str) -> bool:
+    """Every non-empty line of the note is still in the merge, in the same order."""
+    rest = iter(line.strip() for line in merged.splitlines())
+    return all(any(line == m for m in rest) for line in (l.strip() for l in note.splitlines()) if line)
+
+
 def glob_escape(s: str) -> str:
     return "".join(f"[{c}]" if c in "*?[" else c for c in s)
 
 
-def publish(audio: Path, out: Path) -> None:
-    """Copy the pipeline's files into `out`; summary.md goes last and marks it done."""
+def merge_into(team: Path, draft: str, out: Path) -> bool:
+    """Work the draft into the team's note for that day, or leave the note alone.
+
+    The merge is written only when it keeps every line the team wrote and nobody
+    edited the note while the model ran; the note as it was goes to `out` first."""
+    before, seen = team.read_text(encoding="utf-8"), team.stat().st_mtime_ns
+    try:
+        merged = merge_note(before, draft)
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"merge into {team.name} failed: {exc}", file=sys.stderr)
+        return False
+    if not merged.strip() or not kept_whole(before, merged):
+        print(f"merge into {team.name} refused: it dropped or changed a line of the note", file=sys.stderr)
+        return False
+    if team.stat().st_mtime_ns != seen:
+        print(f"merge into {team.name} refused: the note changed while merging", file=sys.stderr)
+        return False
+    shutil.copy2(team, out / f"{team.stem} before merge.md")
+    tmp = team.with_name(f".{team.name}.merge")
+    tmp.write_text(merged.rstrip() + "\n", encoding="utf-8")
+    tmp.replace(team)
+    return True
+
+
+def publish(audio: Path, out: Path) -> str:
+    """Notes beside the audio, the pipeline's files into `out`, then the audio itself:
+    `summary.md` in `out` marks the notes written, the move marks the recording done.
+    A team note already written for that day (`M-DD-YY.md`) gets the draft merged in
+    instead of a draft beside it. Returns the line for the runner's report."""
     stem = audio.stem
     draft = TRANSCRIPTS / f"{stem}-notes" / "summary.md"
     if not draft.is_file() or not (TRANSCRIPTS / f"{stem}.json").is_file():
@@ -100,17 +174,30 @@ def publish(audio: Path, out: Path) -> None:
     out.mkdir(parents=True, exist_ok=True)
     for f in TRANSCRIPTS.glob(f"{glob_escape(stem)}.*"):
         shutil.copy2(f, out / f.name)
-    # Vault first: once summary.md exists the recording is never visited again.
-    vault = vault_dir()
-    if vault.is_dir():
-        name = note_name(audio)
-        shutil.copy2(draft, vault / f"{name} draft.md")
-        shutil.copy2(TRANSCRIPTS / f"{stem}.txt", vault / f"{name} transcript.md")
+    # Never over an existing note: two recordings of one minute, or a draft already edited.
+    base, n, name = note_name(audio), 2, note_name(audio)
+    while (audio.parent / f"{name} draft.md").exists() or (audio.parent / f"{name} transcript.md").exists():
+        name, n = f"{base} {n}", n + 1
+    team = audio.parent / f"{base.split()[0]}.md"
+    if team.is_file() and merge_into(team, draft.read_text(encoding="utf-8"), out):
+        line = f"Meeting notes merged into {team.stem}"
     else:
-        print(f"no vault folder {vault}, skipping the copy", file=sys.stderr)
+        shutil.copy2(draft, audio.parent / f"{name} draft.md")
+        line = f"Meeting notes drafted: {name}"
+    shutil.copy2(TRANSCRIPTS / f"{stem}.txt", audio.parent / f"{name} transcript.md")
     tmp = out / "summary.md.tmp"
     shutil.copy2(draft, tmp)
     tmp.replace(out / "summary.md")
+    archive(audio, out)
+    return line
+
+
+def archive(audio: Path, out: Path) -> None:
+    """Move the recording out of the shared folder; a name already archived keeps both."""
+    target, n = out / audio.name, 2
+    while target.exists():
+        target, n = out / f"{audio.stem} {n}{audio.suffix}", n + 1
+    shutil.move(audio, target)
 
 
 def report(line: str) -> None:
@@ -123,10 +210,27 @@ def report(line: str) -> None:
 
 
 def main() -> int:
+    inbox = inbox_dir()
+    if inbox is None:
+        print("MEETINGS_INBOX is not set on this box: nothing to do", file=sys.stderr)
+        return 0
+    if not inbox.is_dir():
+        print(f"FAILED: the meetings folder {inbox} does not exist", file=sys.stderr)
+        return 1
     root, me = recordings_root(), os.environ.get("HAI_HOSTNAME") or socket.gethostname()
-    todo = pending(root, me)
-    print(f"{len(todo)} recording(s) to do for {me}", file=sys.stderr)
-    failed = 0
+    todo, failed = [], 0
+    for audio in pending(inbox):
+        out = root / me / audio.stem
+        if not (out / "summary.md").exists():
+            todo.append(audio)
+            continue
+        # Notes written, move failed last time: finish it, never redraft over the notes.
+        try:
+            archive(audio, out)
+        except OSError as exc:
+            failed += 1
+            print(f"FAILED to archive {audio.name}: {exc}", file=sys.stderr)
+    print(f"{len(todo)} recording(s) to do in {inbox}", file=sys.stderr)
     # Every transcript before any draft: the local model holds ~3.4 GB of a 6 GB card
     # for minutes after a draft, and the next recording's diarization ran out of
     # memory beside it (2026-10-21).
@@ -140,9 +244,9 @@ def main() -> int:
     for audio in todo:
         try:
             run_meeting(audio)
-            publish(audio, root / me / audio.stem)
+            line = publish(audio, root / me / audio.stem)
             print(f"done: {audio.name}", file=sys.stderr)
-            report(f"Meeting notes drafted: {note_name(audio)}")
+            report(line)
         except (subprocess.CalledProcessError, OSError) as exc:
             failed += 1
             print(f"FAILED {audio.name}: {exc}", file=sys.stderr)
@@ -152,15 +256,14 @@ def main() -> int:
 def selftest() -> None:
     global TRANSCRIPTS
     tmp = Path(tempfile.mkdtemp())
-    root, TRANSCRIPTS = tmp / "rec", tmp / "tr"
-    os.environ["MEETINGS_VAULT_DIR"] = str(tmp / "vault")
-    (tmp / "vault").mkdir()
-    for host, name in [("a", "m [1].m4a"), ("a", "notes.txt"), ("me", "own.m4a"), ("a", "bad.wav")]:
-        (root / host).mkdir(parents=True, exist_ok=True)
-        f = root / host / name
+    inbox, root, TRANSCRIPTS = tmp / "meetings", tmp / "rec", tmp / "tr"
+    inbox.mkdir()
+    for name in ["m [1].m4a", "notes.md", "bad.wav", "voice.mp4"]:
+        f = inbox / name
         f.write_bytes(b"x")
         os.utime(f, (0, 0))
-    assert [p.name for p in pending(root, "me")] == ["bad.wav", "m [1].m4a"]
+    (inbox / "fresh.mp3").write_bytes(b"x")  # still syncing in: left for the next run
+    assert [p.name for p in pending(inbox)] == ["bad.wav", "m [1].m4a", "voice.mp4"]
     calls = []
 
     def fake(audio: Path, transcribe_only: bool = False) -> None:
@@ -175,32 +278,66 @@ def selftest() -> None:
         (TRANSCRIPTS / f"{audio.stem}-notes" / "summary.md").write_text("draft")
 
     globals()["run_meeting"] = fake
+    os.environ.pop("MEETINGS_INBOX", None)
+    assert main() == 0 and calls == []  # no folder set on this box: nothing happens
+    os.environ["MEETINGS_INBOX"] = str(tmp / "missing")
+    assert main() == 1 and calls == []
+    os.environ["MEETINGS_INBOX"] = str(inbox)
     os.environ["HAI_RECORDINGS"], os.environ["HAI_HOSTNAME"] = str(root), "me"
     os.environ["HAI_JOB_REPORT"] = str(tmp / "report.txt")
-    assert main() == 1  # bad.wav failed, the other was still done
-    assert (tmp / "report.txt").read_text() == f"Meeting notes drafted: {note_name(root / 'a' / 'm [1].m4a')}\n"
+    epoch = note_name(inbox / "m [1].m4a")  # no date in the name: from the mtime, pinned to the epoch
+    assert main() == 1  # bad.wav failed, the others were still done
+    assert (tmp / "report.txt").read_text() == f"Meeting notes drafted: {epoch}\nMeeting notes drafted: {epoch} 2\n"
     # Every transcription runs before any draft, and a failed one is not drafted.
-    assert calls == ["bad.wav/t", "m [1].m4a/t", "m [1].m4a"], calls
+    assert calls == ["bad.wav/t", "m [1].m4a/t", "voice.mp4/t", "m [1].m4a", "voice.mp4"], calls
     out = root / "me" / "m [1]"
     assert (out / "summary.md").read_text() == "draft" and (out / "m [1].txt").exists()
-    # No date in "m [1]": named from the mtime, which the setup pinned to the epoch.
-    epoch = note_name(root / "a" / "m [1].m4a")
-    assert (tmp / "vault" / f"{epoch} draft.md").read_text() == "draft"
-    assert (tmp / "vault" / f"{epoch} transcript.md").read_text() == "hello"
+    # The notes land beside the audio; the audio leaves the folder for the archive.
+    assert (inbox / f"{epoch} draft.md").read_text() == "draft"
+    assert (inbox / f"{epoch} transcript.md").read_text() == "hello"
+    assert (inbox / f"{epoch} 2 draft.md").exists()  # same minute: numbered, not written over
+    assert not (inbox / "m [1].m4a").exists() and (out / "m [1].m4a").read_bytes() == b"x"
+    assert sorted(p.name for p in inbox.iterdir() if p.suffix != ".md") == ["bad.wav", "fresh.mp3"]
+    assert (inbox / "notes.md").exists() and not (root / "me" / "bad" / "summary.md").exists()
     assert note_name(Path("Sound record (2026-10-21 10_30_15).m4a")) == "10-21-26 10h30"
     assert note_name(Path("rec 2026-09-02T08:05.wav")) == "9-02-26 08h05"
-    assert not (root / "me" / "bad" / "summary.md").exists()
     calls.clear()
-    assert main() == 1 and calls == ["bad.wav/t"]  # finished one is skipped, failed one retried
-    assert (root / "a" / "m [1].m4a").read_bytes() == b"x"  # inbox untouched
-    # Own folder is excluded: on the recording box there is nothing to do.
-    os.environ["HAI_HOSTNAME"] = "a"
-    assert [p.name for p in pending(root, "a")] == ["own.m4a"]
-    os.environ["HAI_HOSTNAME"] = "me"
-    shutil.rmtree(tmp / "vault")
-    shutil.rmtree(out)
+    assert main() == 1 and calls == ["bad.wav/t"]  # archived ones are gone, the failed one retried
+    # A recording whose notes exist but whose move failed is moved, never redrafted.
+    (inbox / "voice.mp4").write_bytes(b"y")
+    os.utime(inbox / "voice.mp4", (0, 0))
+    (inbox / f"{epoch} draft.md").write_text("edited by hand")
     calls.clear()
-    assert main() == 1 and (out / "summary.md").exists()  # missing vault: skipped, not failed
+    assert main() == 1 and calls == ["bad.wav/t"]
+    assert (inbox / f"{epoch} draft.md").read_text() == "edited by hand"
+    assert (root / "me" / "voice" / "voice 2.mp4").read_bytes() == b"y"
+
+    # A team note for that day gets the draft merged in, the note as it was archived.
+    assert kept_whole("# T\n\n- a\n- b\n", "# T\n- a\n- new\n  - b  \n")
+    assert not kept_whole("# T\n- a\n- b\n", "# T\n- b\n- a\n")  # reordered
+    assert not kept_whole("# T\n- a\n- b\n", "# T\n- a\n")  # dropped
+    assert strip_markers("--- TEAM NOTE ---\n# T\n- a\n--- END TEAM NOTE ---\n") == "# T\n- a\n"
+    team, answers = inbox / "10-21-26.md", []
+    team.write_text("# Team\n- said by hand\n")
+    globals()["merge_note"] = lambda note, draft: answers.pop(0)
+    for stem, answer in [("good", "# Team\n- said by hand\n- from the recording\n"),
+                         ("lossy", "# Team\n- from the recording\n")]:
+        audio = inbox / f"{stem} 2026-10-21 10_30.m4a"
+        audio.write_bytes(b"x")
+        os.utime(audio, (0, 0))
+        answers.append(answer)
+    (tmp / "report.txt").write_text("")
+    calls.clear()
+    assert main() == 1  # bad.wav still failing
+    assert team.read_text() == "# Team\n- said by hand\n- from the recording\n"
+    assert (root / "me" / "good 2026-10-21 10_30" / "10-21-26 before merge.md").read_text() == "# Team\n- said by hand\n"
+    # The lossy merge was refused: the note stands and the draft lands beside it.
+    assert (inbox / "10-21-26 10h30 2 draft.md").read_text() == "draft"
+    assert not (inbox / "10-21-26 10h30 draft.md").exists()  # the merged one wrote no draft
+    assert (inbox / "10-21-26 10h30 transcript.md").exists()
+    assert (tmp / "report.txt").read_text() == (
+        "Meeting notes merged into 10-21-26\nMeeting notes drafted: 10-21-26 10h30 2\n"
+    ), (tmp / "report.txt").read_text()
     shutil.rmtree(tmp)
     print("ok")
 
