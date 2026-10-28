@@ -4,7 +4,9 @@
 Run by the hai-os job runner with no arguments (see docs/meeting-inbox.md). It looks
 for audio in `$MEETINGS_INBOX`, runs meeting.sh on each recording, writes the draft
 and the transcript beside it in that folder, and moves the audio with the whisperX
-files to `$HAI_RECORDINGS/<this host>/<recording name>/`, the archive. With
+files to `$HAI_RECORDINGS/<this host>/<recording name>/`, the archive. A recording
+whose name has no date and time gets its modification time added first, so a file
+name reused for every recording still names one meeting. With
 `MEETINGS_INBOX` unset it does nothing: the folder is set on the one box that should
 do the work, so two boxes sharing it never both take a recording.
 
@@ -28,6 +30,8 @@ TRANSCRIPTS = REPO / "transcripts"  # where meeting.sh writes
 AUDIO = {".m4a", ".wav", ".mp3", ".mp4", ".webm", ".ogg", ".opus", ".flac", ".aac"}
 # A file younger than this may still be recording or syncing in.
 MIN_AGE_S = 120
+#: The date and start time `note_name` reads out of a file name.
+STAMP = re.compile(r"(\d{4})-(\d\d)-(\d\d)[ _T](\d\d)[_:.h-]?(\d\d)")
 
 
 def recordings_root() -> Path:
@@ -84,7 +88,7 @@ def note_name(audio: Path) -> str:
     """`10-21-26 10h30`: the vault's M-DD-YY meeting names, plus the start time so two
     recordings of one day stay apart. The date in the file name wins; the mtime is
     when the recording stopped, not when it began."""
-    m = re.search(r"(\d{4})-(\d\d)-(\d\d)[ _T](\d\d)[_:.h-]?(\d\d)", audio.stem)
+    m = STAMP.search(audio.stem)
     if m:
         y, mo, d, hh, mm = m.groups()
     else:
@@ -132,6 +136,20 @@ def kept_whole(note: str, merged: str) -> bool:
     """Every non-empty line of the note is still in the merge, in the same order."""
     rest = iter(line.strip() for line in merged.splitlines())
     return all(any(line == m for m in rest) for line in (l.strip() for l in note.splitlines()) if line)
+
+
+def stamped(audio: Path, archive: Path) -> Path:
+    """The recording renamed with its time when its name carries none, so a recorder
+    that saves `Recording.m4a` every time still gives each meeting its own transcript
+    and archive folder: both are keyed by the file name. Never onto a name in use in
+    the folder or the archive."""
+    if STAMP.search(audio.stem):
+        return audio
+    base = f"{audio.stem} {time.strftime('%Y-%m-%d %H_%M', time.localtime(audio.stat().st_mtime))}"
+    target, n = audio.with_name(base + audio.suffix), 2
+    while target.exists() or (archive / target.stem).exists():
+        target, n = audio.with_name(f"{base} {n}{audio.suffix}"), n + 1
+    return audio.rename(target)
 
 
 def glob_escape(s: str) -> str:
@@ -220,6 +238,12 @@ def main() -> int:
     root, me = recordings_root(), os.environ.get("HAI_HOSTNAME") or socket.gethostname()
     todo, failed = [], 0
     for audio in pending(inbox):
+        try:
+            audio = stamped(audio, root / me)
+        except OSError as exc:
+            failed += 1
+            print(f"FAILED to rename {audio.name}: {exc}", file=sys.stderr)
+            continue
         out = root / me / audio.stem
         if not (out / "summary.md").exists():
             todo.append(audio)
@@ -268,7 +292,7 @@ def selftest() -> None:
 
     def fake(audio: Path, transcribe_only: bool = False) -> None:
         calls.append(audio.name + ("/t" if transcribe_only else ""))
-        if audio.stem == "bad":
+        if audio.stem.startswith("bad "):
             raise subprocess.CalledProcessError(1, "meeting.sh")
         if transcribe_only:
             return
@@ -286,31 +310,40 @@ def selftest() -> None:
     os.environ["HAI_RECORDINGS"], os.environ["HAI_HOSTNAME"] = str(root), "me"
     os.environ["HAI_JOB_REPORT"] = str(tmp / "report.txt")
     epoch = note_name(inbox / "m [1].m4a")  # no date in the name: from the mtime, pinned to the epoch
+    st = time.strftime("%Y-%m-%d %H_%M", time.localtime(0))  # what a name without one is stamped with
     assert main() == 1  # bad.wav failed, the others were still done
     assert (tmp / "report.txt").read_text() == f"Meeting notes drafted: {epoch}\nMeeting notes drafted: {epoch} 2\n"
     # Every transcription runs before any draft, and a failed one is not drafted.
-    assert calls == ["bad.wav/t", "m [1].m4a/t", "voice.mp4/t", "m [1].m4a", "voice.mp4"], calls
-    out = root / "me" / "m [1]"
-    assert (out / "summary.md").read_text() == "draft" and (out / "m [1].txt").exists()
+    assert calls == [f"bad {st}.wav/t", f"m [1] {st}.m4a/t", f"voice {st}.mp4/t",
+                     f"m [1] {st}.m4a", f"voice {st}.mp4"], calls
+    out = root / "me" / f"m [1] {st}"
+    assert (out / "summary.md").read_text() == "draft" and (out / f"m [1] {st}.txt").exists()
     # The notes land beside the audio; the audio leaves the folder for the archive.
     assert (inbox / f"{epoch} draft.md").read_text() == "draft"
     assert (inbox / f"{epoch} transcript.md").read_text() == "hello"
     assert (inbox / f"{epoch} 2 draft.md").exists()  # same minute: numbered, not written over
-    assert not (inbox / "m [1].m4a").exists() and (out / "m [1].m4a").read_bytes() == b"x"
-    assert sorted(p.name for p in inbox.iterdir() if p.suffix != ".md") == ["bad.wav", "fresh.mp3"]
-    assert (inbox / "notes.md").exists() and not (root / "me" / "bad" / "summary.md").exists()
+    assert not (inbox / "m [1].m4a").exists() and (out / f"m [1] {st}.m4a").read_bytes() == b"x"
+    assert sorted(p.name for p in inbox.iterdir() if p.suffix != ".md") == [f"bad {st}.wav", "fresh.mp3"]
+    assert (inbox / "notes.md").exists() and not (root / "me" / f"bad {st}" / "summary.md").exists()
     assert note_name(Path("Sound record (2026-10-21 10_30_15).m4a")) == "10-21-26 10h30"
     assert note_name(Path("rec 2026-09-02T08:05.wav")) == "9-02-26 08h05"
     calls.clear()
-    assert main() == 1 and calls == ["bad.wav/t"]  # archived ones are gone, the failed one retried
+    assert main() == 1 and calls == [f"bad {st}.wav/t"]  # archived ones are gone, the failed one retried
     # A recording whose notes exist but whose move failed is moved, never redrafted.
-    (inbox / "voice.mp4").write_bytes(b"y")
-    os.utime(inbox / "voice.mp4", (0, 0))
+    (inbox / f"voice {st}.mp4").write_bytes(b"y")
+    os.utime(inbox / f"voice {st}.mp4", (0, 0))
     (inbox / f"{epoch} draft.md").write_text("edited by hand")
     calls.clear()
-    assert main() == 1 and calls == ["bad.wav/t"]
+    assert main() == 1 and calls == [f"bad {st}.wav/t"]
     assert (inbox / f"{epoch} draft.md").read_text() == "edited by hand"
-    assert (root / "me" / "voice" / "voice 2.mp4").read_bytes() == b"y"
+    assert (root / "me" / f"voice {st}" / f"voice {st} 2.mp4").read_bytes() == b"y"
+    # A recorder that reuses its file name: a new recording, never taken for the old one.
+    (inbox / "voice.mp4").write_bytes(b"z")
+    os.utime(inbox / "voice.mp4", (0, 0))
+    calls.clear()
+    assert main() == 1 and calls == [f"bad {st}.wav/t", f"voice {st} 2.mp4/t", f"voice {st} 2.mp4"], calls
+    assert (root / "me" / f"voice {st} 2" / f"voice {st} 2.mp4").read_bytes() == b"z"
+    assert (tmp / "report.txt").read_text().endswith(f"Meeting notes drafted: {epoch} 3\n")
 
     # A team note for that day gets the draft merged in, the note as it was archived.
     assert kept_whole("# T\n\n- a\n- b\n", "# T\n- a\n- new\n  - b  \n")

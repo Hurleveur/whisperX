@@ -6,7 +6,8 @@ it, drafts the notes beside it, and moves the audio out to an archive;
 
 1. **Choose the folder, on one box.** Set `MEETINGS_INBOX` to the folder's path in the
    job's environment. Under hai-os that is this machine's `background/jobs.local.toml`
-   (gitignored, never synced):
+   (gitignored, never synced). The cockpit's Background panel sets it: type the path in
+   the **folder** box on the `meeting-inbox` row. By hand, the file reads:
 
        [jobs.meeting-inbox.env]
        MEETINGS_INBOX = "~/path/to/the/meetings/folder"
@@ -16,7 +17,12 @@ it, drafts the notes beside it, and moves the audio out to an archive;
    same recording. The setting is read on every run, so nothing needs restarting.
 2. **Drop the file** in that folder. Accepted: `.m4a .wav .mp3 .mp4 .webm .ogg .opus
    .flac .aac`. A file under two minutes old is skipped until the next run, so a
-   recording still being written or synced in is left alone.
+   recording still being written or synced in is left alone. The file name may be the
+   same every time (a recorder that always saves `Recording.m4a`): a name without a
+   date and time (`2026-10-21 10_30`, `2026-10-21T10:30`) is renamed in the folder with
+   its modification time when the job picks it up, `Recording 2026-10-21 10_30.m4a`, so
+   each recording gets its own transcript and archive folder. A name already taken in
+   the folder or the archive gets a number.
 3. **Wait.** The job runs only while the box is idle and on mains power, and takes up
    to an hour per recording.
 4. **Find the result.** `<M-DD-YY> <HH>h<MM> draft.md` and `... transcript.md` appear in
