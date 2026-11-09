@@ -179,6 +179,18 @@ def asr_choice(asked: str, gpus: int) -> str:
     return asked if asked != "auto" else ("gpu" if gpus else "tiiny")
 
 
+WHISPERS = {"1": "large-v3-turbo", "2": "large-v3"}
+
+
+def whisper_size(asked: str, language: str, answer: str = "") -> str:
+    """The GPU's Whisper: the one asked for, else the one picked at the prompt, else by language.
+    Turbo is enough for English; large-v3's full decoder may hear Dutch better (to measure,
+    scripts/compare_asr.py)."""
+    if asked != "auto":
+        return asked
+    return WHISPERS.get(answer.strip()) or ("large-v3-turbo" if language == "en" else "large-v3")
+
+
 def cuda_gpus() -> int:
     try:
         import ctranslate2  # the whisperX venv's; absent under the system python3
@@ -247,7 +259,15 @@ def caption(heard: queue.Queue, model: str) -> None:
 
 def main(language: str, model: str, asr: str, whisper: str) -> int:
     asr = asr_choice(asr, cuda_gpus())
-    write = gpu_transcriber(language, whisper) if asr == "gpu" else None
+    write = None
+    if asr == "gpu":
+        answer = ""
+        if whisper == "auto" and sys.stdin.isatty():
+            answer = input(f"Whisper model: [1] large-v3-turbo (fast, fine for English) [2] large-v3 "
+                           f"(slower, maybe better Dutch) [Enter: {whisper_size('auto', language)}] ")
+        whisper = whisper_size(whisper, language, answer)
+        print(f"Whisper {whisper}", flush=True)
+        write = gpu_transcriber(language, whisper)
     mic = subprocess.Popen(["pw-record", "--rate", str(RATE), "--channels", "1", "--format", "s16",
                             "--raw", "-"], stdout=subprocess.PIPE)
     assert mic.stdout is not None
@@ -321,6 +341,10 @@ def selftest() -> None:
     assert heard_as("Vi såg verkligen att det är en fantastisk och sort dåsätt.") == "", "Swedish"
     assert keep_heard("Dat kan je tafels leveren. Moje powodowało to stąd, że on nie rozdera. Dank u wel.") \
         == "Dat kan je tafels leveren. Dank u wel.", "a foreign sentence inside a Dutch clip goes"
+    assert whisper_size("auto", "en") == "large-v3-turbo" and whisper_size("auto", "nl") == "large-v3"
+    assert whisper_size("auto", "nl", "1") == "large-v3-turbo", "the prompt's pick wins over the language"
+    assert whisper_size("auto", "en", "x") == "large-v3-turbo", "a stray answer falls back to the language"
+    assert whisper_size("large-v3", "en", "1") == "large-v3", "--whisper-model wins over everything"
     assert heard_as("哎呀，我天哪！") == heard_as("مرحبا بكم") == "", "Chinese, Arabic"
     print("selftest ok")
 
@@ -331,8 +355,9 @@ if __name__ == "__main__":
     p.add_argument("--language", default="nl", help="spoken language (Whisper holds to it; the Tiiny ignores it today)")
     p.add_argument("--asr", choices=("auto", "gpu", "tiiny"), default="auto",
                    help="who writes the Dutch down: this machine's CUDA GPU, else the Tiiny (auto)")
-    p.add_argument("--whisper-model", default="large-v3-turbo",
-                   help="the GPU's Whisper: large-v3-turbo (default) or large-v3, slower, maybe better Dutch")
+    p.add_argument("--whisper-model", default="auto",
+                   help="the GPU's Whisper: large-v3-turbo, or large-v3 (slower, maybe better Dutch); "
+                        "auto asks at a terminal, else turbo for --language en and large-v3 otherwise")
     p.add_argument("--door", help=f"HAI OS owner door URL (default: the line in {DOOR_FILE})")
     p.add_argument("--model", default="box/tiiny/Qwen/Qwen3.6-35B-A3B", help="chat model translating on the box")
     args = p.parse_args()
