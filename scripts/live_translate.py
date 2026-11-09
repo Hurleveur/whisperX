@@ -40,7 +40,8 @@ BOX = threading.Lock()
 RATE = 16000  # Qwen3-ASR hears a 48 kHz wav wrong; 16 kHz mono s16 is what it expects
 FRAME = RATE // 10  # 100 ms of samples
 LOG = Path.home() / ".local/state/live_translate" / time.strftime("%Y-%m-%d.log")
-NON_LATIN = re.compile(r"[^\x00-\u024f\u2000-\u206f]")  # anything past Latin Extended and punctuation
+# past Latin-1 and punctuation: Dutch, English and French need no more, Polish or Czech do
+NON_LATIN = re.compile(r"[^\x00-\u00ff\u2000-\u206f]")
 DUTCH = set("de het een en is dat van ik je niet wat op zijn er maar ook dan we wij hij zij"
             " met voor als naar nog wel om bij dus kan heb hebben zo moet waar".split())
 ENGLISH = set("the and is that of to it you not what on are but also then we he she with for"
@@ -50,6 +51,8 @@ GERMAN = set("der die das und ist nicht ich mit sie auf ein eine auch sind wir f
 # Spanish, Italian, French; "de" left out, it is Dutch too
 ROMANCE = set("para que la el los las por con una literalmente abbiamo detto il che non per"
               " le les est une pas avec pour".split())
+# Danish, Norwegian, Swedish: the Tiiny drifted into them mid-clip (2026-11-09); "en" left out
+NORDIC = set("og at det er som ikke til jeg har att och är inte jag på av för".split())
 TRANSLATE_PROMPT = ("Translate the Dutch (Flemish) meeting transcript to English. It comes from speech"
                     " recognition and may contain misheard words: translate the intended meaning."
                     " Reply with the English only.")
@@ -139,10 +142,17 @@ def heard_as(text: str) -> str:
     if not text or NON_LATIN.search(text):
         return ""
     words = re.findall(r"[a-zà-ÿ']+", text.lower())
-    nl, en, de, rom = (sum(w in vocab for w in words) for vocab in (DUTCH, ENGLISH, GERMAN, ROMANCE))
+    nl, en, de, rom, nor = (sum(w in vocab for w in words)
+                            for vocab in (DUTCH, ENGLISH, GERMAN, ROMANCE, NORDIC))
     if en > nl and en > de:
         return "en"
-    return "nl" if nl > max(de, rom) or (nl == de == rom == 0 and len(words) < 4) else ""
+    return "nl" if nl > max(de, rom, nor) or (nl == de == rom == nor == 0 and len(words) < 4) else ""
+
+
+def keep_heard(text: str) -> str:
+    """The sentences heard as Dutch or English: the Tiiny switches to German, Danish or Polish
+    for a sentence in the middle of a Dutch clip (2026-11-09)."""
+    return " ".join(s for s in re.split(r"(?<=[.!?])\s+", text) if heard_as(s)).strip()
 
 
 def translate(dutch: str, model: str, before: str = "") -> str:
@@ -177,13 +187,14 @@ def cuda_gpus() -> int:
     return ctranslate2.get_cuda_device_count()
 
 
-def gpu_transcriber(language: str):
-    """faster-whisper on the GPU only. int8_float16 so large-v3-turbo fits beside the local
-    model's ~3.4 GB on the home laptop's 6 GB card (not yet measured there)."""
+def gpu_transcriber(language: str, size: str = "large-v3-turbo"):
+    """faster-whisper on the GPU only. int8_float16 so the model fits beside the local
+    model's ~3.4 GB on the home laptop's 6 GB card (not yet measured there). large-v3-turbo by
+    default; large-v3, its full-size decoder, may hear Dutch better at about half the speed."""
     import numpy
     from faster_whisper import WhisperModel
 
-    model = WhisperModel("large-v3-turbo", device="cuda", compute_type="int8_float16")
+    model = WhisperModel(size, device="cuda", compute_type="int8_float16")
     hot = Path.home() / ".local/share/whisperx/hotwords.txt"  # meeting.sh's names and terms
     words = " ".join(hot.read_text().split()) if hot.is_file() else None
 
@@ -202,7 +213,7 @@ def hear(clips: queue.Queue, heard: queue.Queue, language: str, write=None) -> N
     while True:
         pcm = clips.get()
         try:
-            text = (write or transcribe)(pcm, language)
+            text = keep_heard((write or transcribe)(pcm, language))
         except (RuntimeError, OSError) as e:
             print(f"\033[31m[transcription: {e}]\033[0m", flush=True)
             continue
@@ -234,9 +245,9 @@ def caption(heard: queue.Queue, model: str) -> None:
             log.write(f"{time.strftime('%H:%M:%S')} NL {dutch}\n{time.strftime('%H:%M:%S')} EN {english}\n")
 
 
-def main(language: str, model: str, asr: str) -> int:
+def main(language: str, model: str, asr: str, whisper: str) -> int:
     asr = asr_choice(asr, cuda_gpus())
-    write = gpu_transcriber(language) if asr == "gpu" else None
+    write = gpu_transcriber(language, whisper) if asr == "gpu" else None
     mic = subprocess.Popen(["pw-record", "--rate", str(RATE), "--channels", "1", "--format", "s16",
                             "--raw", "-"], stdout=subprocess.PIPE)
     assert mic.stdout is not None
@@ -307,6 +318,9 @@ def selftest() -> None:
         raise AssertionError("no GPU: --asr gpu refuses, never this CPU")
     except SystemExit:
         pass
+    assert heard_as("Vi såg verkligen att det är en fantastisk och sort dåsätt.") == "", "Swedish"
+    assert keep_heard("Dat kan je tafels leveren. Moje powodowało to stąd, że on nie rozdera. Dank u wel.") \
+        == "Dat kan je tafels leveren. Dank u wel.", "a foreign sentence inside a Dutch clip goes"
     assert heard_as("哎呀，我天哪！") == heard_as("مرحبا بكم") == "", "Chinese, Arabic"
     print("selftest ok")
 
@@ -317,6 +331,8 @@ if __name__ == "__main__":
     p.add_argument("--language", default="nl", help="spoken language (Whisper holds to it; the Tiiny ignores it today)")
     p.add_argument("--asr", choices=("auto", "gpu", "tiiny"), default="auto",
                    help="who writes the Dutch down: this machine's CUDA GPU, else the Tiiny (auto)")
+    p.add_argument("--whisper-model", default="large-v3-turbo",
+                   help="the GPU's Whisper: large-v3-turbo (default) or large-v3, slower, maybe better Dutch")
     p.add_argument("--door", help=f"HAI OS owner door URL (default: the line in {DOOR_FILE})")
     p.add_argument("--model", default="box/tiiny/Qwen/Qwen3.6-35B-A3B", help="chat model translating on the box")
     args = p.parse_args()
@@ -327,4 +343,4 @@ if __name__ == "__main__":
             DOOR = (args.door or DOOR_FILE.read_text()).strip().rstrip("/")
         except FileNotFoundError:
             sys.exit(f"No door: pass --door or write its URL into {DOOR_FILE}")
-        sys.exit(main(args.language, args.model, args.asr))
+        sys.exit(main(args.language, args.model, args.asr, args.whisper_model))

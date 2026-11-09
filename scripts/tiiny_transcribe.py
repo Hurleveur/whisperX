@@ -79,10 +79,11 @@ def transcribe(audio: Path, out_dir: Path) -> Path:
             log.flush()
             if i % 25 == 0:
                 print(f"  {i}/{len(parts)}", file=sys.stderr, flush=True)
-    # a clip the box heard in another script is noise ("呃。"); other Latin languages are kept,
-    # since a meeting may mix French or English into the Dutch
-    segments = [{"start": r["start"], "end": r["end"], "text": " " + r["text"]}
-                for _, r in sorted(done.items()) if r["text"] and not live.NON_LATIN.search(r["text"])]
+    # a clip the box heard in another script is noise ("呃。"), and so is a sentence in German,
+    # Danish or Polish inside a Dutch clip; English is kept
+    # sentence by sentence, since the box switches language mid-clip; the jsonl keeps it raw
+    segments = [{"start": r["start"], "end": r["end"], "text": " " + text}
+                for _, r in sorted(done.items()) if (text := live.keep_heard(r["text"]))]
     json_path = out_dir / f"{audio.stem}.json"
     tmp = json_path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps({"segments": segments, "asr": "tiiny Qwen3-ASR"}, ensure_ascii=False))
