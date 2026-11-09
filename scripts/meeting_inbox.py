@@ -96,46 +96,131 @@ def note_name(audio: Path) -> str:
     return f"{int(mo)}-{d}-{y[2:]} {hh}h{mm}"
 
 
-def merge_note(note: str, draft: str) -> str:
-    """The team's note for that day with the recording's draft worked in, by the model."""
-    import analyze_meeting  # beside this script; only a merge needs it
-
+def model_args() -> argparse.Namespace:
     env = llm_env()
-    args = argparse.Namespace(
+    return argparse.Namespace(
         api=env["LLM_API"], host=env["LLM_HOST"], model=env["LLM_MODEL"], ctx=32768,
         token_file=Path(env["LLM_TOKEN_FILE"]) if env.get("LLM_TOKEN_FILE") else None,
         escalate=env.get("LLM_ESCALATE", ""),
     )
-    # The note before the draft: the model reads what the team already wrote, its
-    # headings and its people, before it sees what to add.
+
+
+#: A photo's reading is a page at most; the cap is what ends a loop.
+PHOTO_TOKENS = 1500
+
+
+def once_each(text: str) -> str:
+    """A line the model repeated straight after itself kept once: reading a whiteboard,
+    the Tiiny's Qwen3.6-35B wrote one word on a line ~1000 times (2026-11-09)."""
+    out = []
+    for line in text.splitlines():
+        if not (out and line.strip() and line.strip() == out[-1].strip()):
+            out.append(line)
+    return "\n".join(out)
+
+
+def read_photos(photos: list[Path]) -> dict[str, str]:
+    """What each photo shows, by file name, one request per photo: two images in one
+    request stopped the Tiiny's Qwen3.6-35B twice (2026-11-09) where one alone answered.
+    A photo the model fails on is left out with a line on stderr."""
+    import analyze_meeting
+
+    args = model_args()
+    if args.escalate:  # the cloud lane rebuilds the messages as plain text
+        return {}
+    seen = {}
+    for photo in photos:
+        try:
+            seen[photo.name] = once_each(analyze_meeting.generate(
+                "This photo was taken during a team meeting (a whiteboard, a slide, a sketch "
+                "or a page). Transcribe every word written on it exactly, then say in a few "
+                "lines what it shows and how its parts connect. Nothing else.",
+                args, [photo], limit=PHOTO_TOKENS))
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"photo {photo.name} not read, left out: {exc}", file=sys.stderr)
+    return seen
+
+
+def merge_note(note: str, draft: str, photos: dict[str, str] | None = None) -> str:
+    """The notes that go under the team's note: the recording's draft worked together with
+    what the note and its photos (`read_photos`) say. The note itself is put back above by
+    the caller."""
+    import analyze_meeting  # beside this script; only a merge needs it
+
+    shown = "".join(f"--- PHOTO {name} ---\n{text}\n--- END PHOTO ---\n\n"
+                    for name, text in (photos or {}).items())
     answer = analyze_meeting.generate(
-        "You keep a team's meeting note. Below is the note the team wrote, then notes "
-        "drafted by a machine from a recording of that day's meeting.\n\n"
+        "You write a team's meeting notes. Below is the note the team wrote by hand, "
+        + ("what the photos it embeds show, " if shown else "")
+        + "then notes drafted by a machine from a recording of that day's meeting.\n\n"
         f"--- TEAM NOTE ---\n{note}\n--- END TEAM NOTE ---\n\n"
+        f"{shown}"
         f"--- DRAFT FROM THE RECORDING ---\n{draft}\n--- END DRAFT ---\n\n"
-        "Rules. Read the team note first: its headings, its people, what it already says. "
-        "Output the whole team note with what the draft adds worked in where it belongs. "
-        "Copy every line of the team note exactly, in its order. Never reword, move or "
-        "delete one. Add only what the draft says and the note does not. Already in the "
-        "note - skip. Keep the draft's quotes exactly. Write additions in the note's "
-        "language. Output the note only.",
-        args,
+        "Rules. The team note stays above your answer exactly as it is: do not copy it. "
+        "Write the meeting notes that go under it: everything the draft says, worked "
+        "together with what the team note and the photos add, in the draft's headings. "
+        + ("Add a section `## From the photos`: for each photo, what it shows and how it "
+           "ties to what was said. " if shown else "")
+        + "Where the team note names the people, write a name in place of a SPEAKER label "
+        "only when the note and the draft make clear who it is. Keep the draft's quotes "
+        "exactly. Write in the team note's language. Output the notes only.",
+        model_args(),
     )
-    return strip_markers(answer)
+    return without_note(note, strip_markers(answer))
+
+
+def without_note(note: str, answer: str) -> str:
+    """The answer minus a copy of the note it opens with: told not to, the Tiiny's
+    Qwen3.6-35B still began with the whole note (2026-11-09), which the caller puts above."""
+    want = [line.strip() for line in note.splitlines() if line.strip()]
+    lines = answer.splitlines()
+    i = 0
+    for line in lines:
+        if i == len(want) or (line.strip() and line.strip() != want[i]):
+            break
+        i += bool(line.strip())
+    if i < len(want):
+        return answer
+    rest, seen = [], 0
+    for line in lines:
+        if seen < len(want):
+            seen += bool(line.strip())
+            continue
+        rest.append(line)
+    return "\n".join(rest).strip()
+
+
+#: An image the note embeds, Obsidian's `![[name]]` or Markdown's `![](path)`.
+EMBED = re.compile(r"!\[\[([^\]|#]+)[^\]]*\]\]|!\[[^\]]*\]\(<?([^)>]+?)>?\)")
+PICTURE = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+MAX_PHOTOS = 8
+
+
+def photos(note: str, where: Path) -> list[Path]:
+    """The images the note at `where` embeds, found the way Obsidian finds them: beside
+    the note, then by name anywhere in the vault (the folder holding `.obsidian`)."""
+    vault = next((d for d in where.parents if (d / ".obsidian").is_dir()), where.parent)
+    found = []
+    for m in EMBED.finditer(note):
+        name = (m.group(1) or m.group(2)).strip()
+        if Path(name).suffix.lower() not in PICTURE:
+            continue
+        hit = where.parent / name
+        if not hit.is_file():
+            hit = next((p for p in vault.rglob(Path(name).name) if p.is_file()), None)
+        if hit is None:
+            print(f"photo not found, left out: {name}", file=sys.stderr)
+        elif hit not in found:
+            found.append(hit)
+    return found[:MAX_PHOTOS]
 
 
 #: The prompt's own fences, which the model echoes back (seen live, 2026-10-28).
-MARKERS = re.compile(r"^--- (END )?(TEAM NOTE|DRAFT FROM THE RECORDING) ---[ \t]*\n?", re.MULTILINE)
+MARKERS = re.compile(r"^--- (END )?(TEAM NOTE|DRAFT FROM THE RECORDING|PHOTO.*?) ---[ \t]*\n?", re.MULTILINE)
 
 
 def strip_markers(answer: str) -> str:
     return MARKERS.sub("", answer)
-
-
-def kept_whole(note: str, merged: str) -> bool:
-    """Every non-empty line of the note is still in the merge, in the same order."""
-    rest = iter(line.strip() for line in merged.splitlines())
-    return all(any(line == m for m in rest) for line in (l.strip() for l in note.splitlines()) if line)
 
 
 def stamped(audio: Path, archive: Path) -> Path:
@@ -157,25 +242,30 @@ def glob_escape(s: str) -> str:
 
 
 def merge_into(team: Path, draft: str, out: Path) -> bool:
-    """Work the draft into the team's note for that day, or leave the note alone.
+    """Put the recording's notes under the team's note for that day, or leave it alone.
 
-    The merge is written only when it keeps every line the team wrote and nobody
-    edited the note while the model ran; the note as it was goes to `out` first."""
+    What the team wrote stays first, byte for byte: the model only writes what goes
+    under it. Nothing is written if the note changed while the model ran; the note as
+    it was goes to `out` first."""
     before, seen = team.read_text(encoding="utf-8"), team.stat().st_mtime_ns
     try:
-        merged = merge_note(before, draft)
+        read = read_photos(photos(before, team))
+        if read:  # kept as it came: the notes can be redone from it without the model
+            (out / "photos.md").write_text("".join(f"## {n}\n\n{t}\n\n" for n, t in read.items()),
+                                           encoding="utf-8")
+        notes = merge_note(before, draft, read)
     except (OSError, ValueError, KeyError) as exc:
         print(f"merge into {team.name} failed: {exc}", file=sys.stderr)
         return False
-    if not merged.strip() or not kept_whole(before, merged):
-        print(f"merge into {team.name} refused: it dropped or changed a line of the note", file=sys.stderr)
+    if not notes.strip():
+        print(f"merge into {team.name} refused: the model wrote nothing", file=sys.stderr)
         return False
     if team.stat().st_mtime_ns != seen:
         print(f"merge into {team.name} refused: the note changed while merging", file=sys.stderr)
         return False
     shutil.copy2(team, out / f"{team.stem} before merge.md")
     tmp = team.with_name(f".{team.name}.merge")
-    tmp.write_text(merged.rstrip() + "\n", encoding="utf-8")
+    tmp.write_text(before.rstrip() + "\n\n" + notes.strip() + "\n", encoding="utf-8")
     tmp.replace(team)
     return True
 
@@ -345,16 +435,22 @@ def selftest() -> None:
     assert (root / "me" / f"voice {st} 2" / f"voice {st} 2.mp4").read_bytes() == b"z"
     assert (tmp / "report.txt").read_text().endswith(f"Meeting notes drafted: {epoch} 3\n")
 
-    # A team note for that day gets the draft merged in, the note as it was archived.
-    assert kept_whole("# T\n\n- a\n- b\n", "# T\n- a\n- new\n  - b  \n")
-    assert not kept_whole("# T\n- a\n- b\n", "# T\n- b\n- a\n")  # reordered
-    assert not kept_whole("# T\n- a\n- b\n", "# T\n- a\n")  # dropped
+    # A team note for that day keeps what the team wrote first, untouched, and gets the
+    # recording's notes under it; the note as it was is archived.
     assert strip_markers("--- TEAM NOTE ---\n# T\n- a\n--- END TEAM NOTE ---\n") == "# T\n- a\n"
-    team, answers = inbox / "10-21-26.md", []
-    team.write_text("# Team\n- said by hand\n")
-    globals()["merge_note"] = lambda note, draft: answers.pop(0)
-    for stem, answer in [("good", "# Team\n- said by hand\n- from the recording\n"),
-                         ("lossy", "# Team\n- from the recording\n")]:
+    team, answers, shown = inbox / "10-21-26.md", [], []
+    team.write_text("---\nparticipants: A, B\n---\n# Team\n- said by hand\n![[board.jpg]]\n")
+    (tmp / ".obsidian").mkdir()
+    (tmp / "Attachments").mkdir()
+    (tmp / "Attachments" / "board.jpg").write_bytes(b"jpg")
+
+    def fake_merge(note: str, draft: str, photos: dict[str, str] | None = None) -> str:
+        shown.append(photos)
+        return answers.pop(0)
+
+    globals()["merge_note"] = fake_merge
+    globals()["read_photos"] = lambda found: {p.name: f"what {p.name} shows" for p in found}
+    for stem, answer in [("good", "- from the recording\n- what the board shows\n"), ("nothing", "  \n")]:
         audio = inbox / f"{stem} 2026-10-21 10_30.m4a"
         audio.write_bytes(b"x")
         os.utime(audio, (0, 0))
@@ -362,15 +458,30 @@ def selftest() -> None:
     (tmp / "report.txt").write_text("")
     calls.clear()
     assert main() == 1  # bad.wav still failing
-    assert team.read_text() == "# Team\n- said by hand\n- from the recording\n"
-    assert (root / "me" / "good 2026-10-21 10_30" / "10-21-26 before merge.md").read_text() == "# Team\n- said by hand\n"
-    # The lossy merge was refused: the note stands and the draft lands beside it.
+    assert team.read_text() == (
+        "---\nparticipants: A, B\n---\n# Team\n- said by hand\n![[board.jpg]]\n\n"
+        "- from the recording\n- what the board shows\n"
+    ), team.read_text()
+    assert shown[0] == {"board.jpg": "what board.jpg shows"}  # found in the vault, read
+    assert (root / "me" / "good 2026-10-21 10_30" / "photos.md").read_text() == (
+        "## board.jpg\n\nwhat board.jpg shows\n\n")
+    assert strip_markers("--- PHOTO a.jpg ---\nx\n--- END PHOTO ---\n") == "x\n"
+    assert without_note("---\nA\n---\nhi", "---\nA\n---\n\nhi\n\n## Summary\nx") == "## Summary\nx"
+    assert without_note("---\nA\n---\nhi", "## Summary\n---\nA") == "## Summary\n---\nA"  # no copy
+    assert without_note("hi\nthere", "hi\n## Summary") == "hi\n## Summary"  # a partial copy is kept
+    assert once_each("Hyper\nDyscic\nDyscic\n  Dyscic\n\n\nend") == "Hyper\nDyscic\n\n\nend"
+    assert (root / "me" / "good 2026-10-21 10_30" / "10-21-26 before merge.md").read_text().endswith("![[board.jpg]]\n")
+    # An empty answer is refused: the note stands and the draft lands beside it.
     assert (inbox / "10-21-26 10h30 2 draft.md").read_text() == "draft"
     assert not (inbox / "10-21-26 10h30 draft.md").exists()  # the merged one wrote no draft
     assert (inbox / "10-21-26 10h30 transcript.md").exists()
     assert (tmp / "report.txt").read_text() == (
         "Meeting notes merged into 10-21-26\nMeeting notes drafted: 10-21-26 10h30 2\n"
     ), (tmp / "report.txt").read_text()
+    # Embeds of both kinds, beside the note or anywhere in the vault; others left out.
+    (inbox / "beside.png").write_bytes(b"png")
+    note = "![[board.jpg|300]] ![](beside.png) ![[talk.pdf]] ![[gone.jpg]] ![[board.jpg]]"
+    assert [p.name for p in photos(note, team)] == ["board.jpg", "beside.png"]
     shutil.rmtree(tmp)
     print("ok")
 

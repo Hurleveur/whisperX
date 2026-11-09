@@ -11,7 +11,10 @@ final pass merges them into summary.md following the (optional) template.
 """
 
 import argparse
+import base64
+import io
 import json
+import mimetypes
 import os
 import pathlib
 import re
@@ -58,7 +61,7 @@ def chunk(text: str, size: int) -> list[str]:
     return chunks + [current] if current else chunks
 
 
-def request(prompt: str, args) -> urllib.request.Request:
+def request(prompt: str, args, images: list[pathlib.Path] = (), limit: int = 6000) -> urllib.request.Request:
     # Low temperature because this is extraction, not writing: at the default the
     # model invents attendees who were never there, and spells one name three ways.
     # The output cap because nothing else stops a loop: a merge once ran 61 minutes on
@@ -72,10 +75,13 @@ def request(prompt: str, args) -> urllib.request.Request:
         url = f"{args.host}/chat/completions"
         body = {
             "model": args.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                *({"type": "image_url", "image_url": {"url": data_url(i)}} for i in images),
+            ] if images else prompt}],
             "stream": False,
             "temperature": 0.2,
-            "max_tokens": 6000,
+            "max_tokens": limit,
         }
     else:
         # num_ctx matters: ollama defaults to a small window and truncates the FRONT
@@ -93,8 +99,10 @@ def request(prompt: str, args) -> urllib.request.Request:
             "prompt": prompt,
             "stream": False,
             "think": True,
-            "options": {"num_ctx": args.ctx, "temperature": 0.2, "num_predict": 6000},
+            "options": {"num_ctx": args.ctx, "temperature": 0.2, "num_predict": limit},
         }
+        if images:
+            body["images"] = [base64.b64encode(picture(i)[1]).decode() for i in images]
     headers = {"Content-Type": "application/json"}
     if args.api == "openai" and args.token_file:
         # hai-context rejects an unauthenticated call. Read here, per request, so the
@@ -108,8 +116,36 @@ def request(prompt: str, args) -> urllib.request.Request:
     return urllib.request.Request(url, json.dumps(body).encode(), headers)
 
 
-def generate(prompt: str, args) -> str:
-    with urllib.request.urlopen(request(prompt, args)) as resp:
+#: A phone photo is 4096x3072: two at full size in one request stopped the Tiiny's
+#: Qwen3.6-35B (2026-11-09), and one at full size read no better than this.
+PHOTO_EDGE = 1536
+
+
+def picture(image: pathlib.Path) -> tuple[str, bytes]:
+    """The image's type and bytes as sent: a large photo shrunk to PHOTO_EDGE as JPEG,
+    anything Pillow cannot read sent as it is."""
+    from PIL import Image, UnidentifiedImageError  # torchvision's dependency
+
+    try:
+        with Image.open(image) as im:
+            if max(im.size) <= PHOTO_EDGE:
+                raise UnidentifiedImageError("small enough")
+            im.thumbnail((PHOTO_EDGE, PHOTO_EDGE))
+            out = io.BytesIO()
+            im.convert("RGB").save(out, "JPEG", quality=85)
+            return "image/jpeg", out.getvalue()
+    except (UnidentifiedImageError, OSError):
+        return mimetypes.guess_type(image.name)[0] or "image/jpeg", image.read_bytes()
+
+
+def data_url(image: pathlib.Path) -> str:
+    kind, raw = picture(image)
+    return f"data:{kind};base64,{base64.b64encode(raw).decode()}"
+
+
+def generate(prompt: str, args, images: list[pathlib.Path] = (), limit: int = 6000) -> str:
+    """`images` go with the prompt, for a model that reads them; `limit` caps the answer."""
+    with urllib.request.urlopen(request(prompt, args, images, limit)) as resp:
         data = json.load(resp)
     # ollama's `thinking` field, and openai's `reasoning_content`, are both deliberately
     # ignored: only what the model committed to as the answer is kept.
@@ -587,6 +623,17 @@ def selftest() -> None:
     assert req.full_url == "http://h/chat/completions"
     assert json.loads(req.data)["messages"] == [{"role": "user", "content": "p"}]
     assert json.loads(req.data)["max_tokens"] == 6000
+    pic = pathlib.Path("/tmp/_m.png")
+    pic.write_bytes(b"\x89PNG")
+    text, part = json.loads(request("p", ns, [pic]).data)["messages"][0]["content"]
+    assert text == {"type": "text", "text": "p"}
+    assert part["image_url"]["url"] == "data:image/png;base64,iVBORw=="  # unreadable: as it is
+    from PIL import Image
+
+    big = pathlib.Path("/tmp/_m.jpg")
+    Image.new("RGB", (4096, 3072)).save(big)
+    kind, raw = picture(big)
+    assert kind == "image/jpeg" and Image.open(io.BytesIO(raw)).size == (1536, 1152)
     assert not req.has_header("Authorization")
     tok = pathlib.Path("/tmp/_m.token")
     tok.write_text("s3cret\n")

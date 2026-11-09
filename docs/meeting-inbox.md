@@ -36,16 +36,23 @@ it, drafts the notes beside it, and moves the audio out to an archive;
    moved, never redrafted.
 
    **A note already written for that day** (`<M-DD-YY>.md`, the team's own name for a
-   meeting note) is not given a draft beside it: the model reads that note first, then
-   the draft, and writes the note back with what the recording adds. The merge is kept
-   only if every line the team wrote is still there, unchanged and in order, and nobody
-   edited the note while the model ran; the note as it was is copied to the archive
-   first, as `<M-DD-YY> before merge.md`. A merge that fails either check is thrown
-   away and the draft is written beside the note as usual. The model chooses where the
-   additions go (on the first live runs it added a section at the end), and its
-   additions are not checked against the transcript beyond the draft's own quotes:
-   read them as a draft. The merge uses the same model and cloud purpose as the draft,
-   so the team's note leaves the box for that call too.
+   meeting note) is not given a draft beside it. What the team wrote stays at the top,
+   byte for byte, and the meeting notes go under it: the model reads the note, the
+   photos it embeds and the draft, and writes notes that work all three together
+   (it may restate what the note says; it never edits the note). Photos are the
+   images the note embeds, `![[name.jpg]]` or `![](path.png)`, found beside the note or
+   anywhere in the vault, at most 8, shrunk to 1536 px on the long side. Each photo is
+   read in its own request first (two images in one request stopped the Tiiny's model
+   twice), and what each shows is kept in the archive as `photos.md`; the notes are then
+   written from the note, those readings and the draft. A photo that cannot be found or
+   read is left out with a line on stderr. Photos go only to a model reached directly, never
+   through the cloud purpose, which sends text alone. Nothing is written if the model
+   answers nothing or someone edited the note while it ran; the draft is then written
+   beside the note as usual. The note as it was is copied to the archive first, as
+   `<M-DD-YY> before merge.md`. The notes are not checked against the transcript beyond
+   the draft's own quotes: read them as a draft. The merge uses the same model and cloud
+   purpose as the draft, so with a cloud purpose set the team's note leaves the box for
+   that call too.
 5. **Name the speakers and redo the draft.** Voices enrolled earlier are named
    automatically (step 6). For anyone else, read the `.txt`, note which `SPEAKER_NN`
    is who, then on the processing box, from the whisperX checkout:
