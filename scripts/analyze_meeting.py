@@ -46,6 +46,10 @@ def read_transcript(path: pathlib.Path, names: dict[str, str] | None = None) -> 
     names = names or {}
     if path.suffix == ".json":
         segments = json.loads(path.read_text())["segments"]
+        # An undiarized transcript (the Tiiny's) has no speakers: "UNKNOWN:" on every line
+        # would make UNKNOWN the only voice, and keep_quoted would drop every owned task.
+        if not any("speaker" in s for s in segments):
+            return "\n".join(s["text"].strip() for s in segments)
         return "\n".join(
             f"{names.get(s.get('speaker'), s.get('speaker', 'UNKNOWN'))}: {s['text'].strip()}"
             for s in segments
@@ -695,6 +699,9 @@ def selftest() -> None:
     tmp.write_text('{"segments":[{"speaker":"S1","text":" hi "},{"text":"ho"}]}')
     assert read_transcript(tmp) == "S1: hi\nUNKNOWN: ho"
     assert read_transcript(tmp, {"S1": "Alice"}) == "Alice: hi\nUNKNOWN: ho"
+    tmp.write_text('{"segments":[{"text":" hi "},{"text":"ho"}]}')
+    assert read_transcript(tmp) == "hi\nho", "no speakers at all: no UNKNOWN on every line"
+    assert spoken(read_transcript(tmp)) == {}, "so keep_quoted holds no owner to UNKNOWN"
     # The two backends disagree on url, on where the prompt goes and on where the
     # answer comes back; getting either half crossed sends a valid-looking request
     # nowhere useful.
