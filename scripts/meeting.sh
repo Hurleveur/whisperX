@@ -33,7 +33,9 @@ Environment:
   ASR              whisperx (default where nvidia-smi sees a GPU) or tiiny
                    (default elsewhere: scripts/tiiny_transcribe.py, door URL in
                    ~/.config/hai/door)
-  WHISPER_MODEL    whisper model (default: large-v2)
+  WHISPER_MODEL    whisper model (default: auto: on a GPU, large-v3-turbo when
+                   the recording is English, --language en or heard so in its
+                   first minutes, else large-v3; without a GPU large-v3-turbo)
   BATCH_SIZE       whisperX batch size (default: 4; lower it if VRAM is tight)
   WHISPER_HOTWORDS_FILE  words whisper should expect, such as product and
                    people names, comma-separated (default:
@@ -100,6 +102,9 @@ else
         nv=$(echo "$repo"/.venv/lib/python*/site-packages/nvidia)
         export LD_LIBRARY_PATH="$nv/cudnn/lib:$nv/cublas/lib:$nv/cuda_runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
         compute=float16
+        if [ "${WHISPER_MODEL:-auto}" = auto ]; then
+            WHISPER_MODEL=$("$repo/.venv/bin/python" "$repo/scripts/pick_whisper.py" "$audio" "$@")
+        fi
     else
         # float16 is a GPU format, and whisperX's CPU default of float32 costs hours on
         # a long recording for no accuracy worth having.
@@ -111,10 +116,13 @@ else
     hot=()
     if [ -s "$hotwords_file" ]; then hot=(--hotwords "$(tr '\n' ' ' < "$hotwords_file")"); fi
 
+    # no GPU (ASR=whisperx forced): the cheapest model
+    if [ "${WHISPER_MODEL:-auto}" = auto ]; then WHISPER_MODEL=large-v3-turbo; fi
+
     # A run that dies with no traceback is usually the OOM killer: earlyoom takes
     # this out around 3.5 GB RSS when free RAM runs low.
     "$repo/.venv/bin/whisperx" "$audio" \
-        --model "${WHISPER_MODEL:-large-v2}" \
+        --model "$WHISPER_MODEL" \
         --diarize \
         --speaker_embeddings \
         --batch_size "${BATCH_SIZE:-4}" \

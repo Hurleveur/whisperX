@@ -85,9 +85,6 @@ def running_box_model(door: str, listing: dict | None = None) -> str:
 def llm_env() -> dict[str, str]:
     """The environment meeting.sh drafts with, which the merge uses too."""
     env = {**os.environ}
-    # large-v2 is meeting.sh's default; turbo is the speed/accuracy trade for a job
-    # that owns the GPU for the duration.
-    env.setdefault("WHISPER_MODEL", "large-v3-turbo")
     # The Background panel's pick (the runner's HAI_JOB_MODEL): a model on the owner's
     # box, named (`box/<box>/<model>`) or whichever runs there (`ctx-any-local`), asked
     # through the owner door, which answers any of his boxes on the tailnet by its
