@@ -50,25 +50,34 @@ def rms(frame: bytes) -> float:
 
 
 class Chunker:
-    """Groups 100 ms frames into utterances: ends one after `pause` quiet frames, or at `longest`."""
+    """Groups 100 ms frames into utterances: ends one after `pause` quiet frames, or at `longest`.
+    At `longest` the clip is cut at its quietest frame in the second half and the rest starts the
+    next one: in a busy room speech rarely pauses long enough, and a cut mid-word garbled the
+    words on both sides (2026-11-09)."""
 
     def __init__(self, threshold: float, pause: int = 7, shortest: int = 5, longest: int = 80):
         self.threshold, self.pause, self.shortest, self.longest = threshold, pause, shortest, longest
         self.frames: list[bytes] = []
-        self.voiced = self.quiet = 0
+        self.levels: list[float] = []
 
     def feed(self, frame: bytes) -> bytes | None:
-        loud = rms(frame) > self.threshold
-        if not self.frames and not loud:
+        level = rms(frame)
+        if not self.frames and level <= self.threshold:
             return None
         self.frames.append(frame)
-        self.voiced += loud
-        self.quiet = 0 if loud else self.quiet + 1
-        if self.quiet < self.pause and len(self.frames) < self.longest:
+        self.levels.append(level)
+        quiet = next((i for i, x in enumerate(reversed(self.levels)) if x > self.threshold),
+                     len(self.levels))
+        if quiet >= self.pause:
+            cut = len(self.frames)
+        elif len(self.frames) >= self.longest:
+            half = len(self.levels) // 2
+            cut = half + min(range(len(self.levels) - half), key=lambda i: self.levels[half + i]) + 1
+        else:
             return None
-        clip, voiced = b"".join(self.frames), self.voiced
-        self.frames, self.voiced, self.quiet = [], 0, 0
-        return clip if voiced >= self.shortest else None
+        clip, levels = b"".join(self.frames[:cut]), self.levels[:cut]
+        self.frames, self.levels = self.frames[cut:], self.levels[cut:]
+        return clip if sum(x > self.threshold for x in levels) >= self.shortest else None
 
 
 def as_wav(pcm: bytes) -> bytes:
@@ -180,7 +189,8 @@ def main(language: str, model: str, whisper_model: str) -> int:
     read = lambda: stdout.read(FRAME * 2)
     # the quietest 100 ms of 2 s: people may already be talking when this starts
     floor = min(rms(read()) for _ in range(20))
-    chunker = Chunker(threshold=max(floor * 1.3, 150))
+    # 12 s, not 8: on room audio the box garbled more clips cut at 5 to 8 s (2026-11-09 A/B)
+    chunker = Chunker(threshold=max(floor * 1.3, 150), longest=120)
     print(f"Listening (noise floor {floor:.0f}, speech above {chunker.threshold:.0f}). Ctrl+C stops.\n")
     LOG.parent.mkdir(parents=True, exist_ok=True)
     clips: queue.Queue = queue.Queue()
@@ -204,6 +214,11 @@ def selftest() -> None:
     assert out[:-1] == [None] * 16 and len(out[-1] or b"") == 17 * FRAME * 2, "cut after a 0.7 s pause"
     assert [c.feed(f) for f in [loud] * 2 + [quiet] * 7][-1] is None, "a cough is not an utterance"
     assert sum(c.feed(loud) is not None for _ in range(80)) == 1, "a long monologue is cut at 8 s"
+    dip = array.array("h", [400] * FRAME).tobytes()  # a breath: louder than silence, quietest here
+    c = Chunker(threshold=150)
+    out = [c.feed(f) for f in [loud] * 59 + [dip] + [loud] * 20]
+    assert len(out[-1] or b"") == 60 * FRAME * 2, "cut at the quietest frame, not mid-word"
+    assert len(c.frames) == 20, "the words after the cut start the next clip"
     rows = columns("een twee drie vier vijf zes", "one two", 24)
     assert len(rows) == 3 and all("│" in r for r in rows), "Dutch and English share rows"
     assert rows[0].index("│") == rows[2].index("│"), "the divider is aligned"
