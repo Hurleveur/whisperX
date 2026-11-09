@@ -166,9 +166,11 @@ def main(language: str, model: str, whisper_model: str) -> int:
         return " ".join(s.text.strip() for s in segments)
 
     def translate(dutch: str) -> str:
-        batch = tokenizer([dutch], return_tensors="pt", truncation=True)
+        # one sentence each: given several, Marian drops the last ones
+        sentences = [x for x in re.split(r"(?<=[.!?])\s+", dutch) if x.strip()]
+        batch = tokenizer(sentences, return_tensors="pt", padding=True, truncation=True)
         out = marian.generate(**batch, max_new_tokens=256, num_beams=2)
-        return tokenizer.decode(out[0], skip_special_tokens=True)
+        return " ".join(tokenizer.batch_decode(out, skip_special_tokens=True))
 
     mic = subprocess.Popen(["pw-record", "--rate", str(RATE), "--channels", "1", "--format", "s16",
                             "--raw", "-"], stdout=subprocess.PIPE)
