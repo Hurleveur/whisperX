@@ -124,7 +124,8 @@ not checked at all: read the draft as a rough index of the transcript, not as th
 - For whisperX (a machine with an NVIDIA GPU, or `ASR=whisperx`; `ASR=tiiny` forces the
   Tiiny): the Whisper weights (downloaded on first use; `large-v3` for a recording in Dutch or
   any language but English, `large-v3-turbo` for English, which turbo first hears in the
-  recording's opening minutes on the GPU, `scripts/pick_whisper.py`) and a
+  recording's opening minutes on the GPU, `scripts/pick_whisper.py`; `scripts/compare_asr.py`
+  shows turbo, large-v3 and the Tiiny side by side on a stretch of a recording) and a
   Hugging Face token the pyannote diarization models accept, as `HF_TOKEN` in the job's
   environment or in the `huggingface_hub` login cache, with the gated model terms accepted.
 - When the job finishes a recording it leaves a quiet row in the cockpit's Activity
