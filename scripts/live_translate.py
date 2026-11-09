@@ -35,7 +35,13 @@ DOOR = ""  # set from --door or DOOR_FILE when the script starts
 RATE = 16000  # Qwen3-ASR hears a 48 kHz wav wrong; 16 kHz mono s16 is what it expects
 FRAME = RATE // 10  # 100 ms of samples
 LOG = Path.home() / ".local/state/live_translate" / time.strftime("%Y-%m-%d.log")
-CJK = re.compile(r"[぀-ヿ㐀-鿿가-힯]")
+NON_LATIN = re.compile(r"[^\x00-\u024f\u2000-\u206f]")  # anything past Latin Extended and punctuation
+DUTCH = set("de het een en is dat van ik je niet wat op zijn er maar ook dan we wij hij zij"
+            " met voor als naar nog wel om bij dus kan heb hebben zo moet waar".split())
+ENGLISH = set("the and is that of to it you not what on are but also then we he she with for"
+              " as at this have i'm i my our your".split())
+GERMAN = set("der die das und ist nicht ich mit sie auf ein eine auch sind wir für dass"
+             " nach noch aber wie oder bei zu den dem des wenn kann haben so muss wo".split())
 
 
 def rms(frame: bytes) -> float:
@@ -108,18 +114,34 @@ def columns(dutch: str, english: str, width: int) -> list[str]:
     return [f"\033[2m{a:<{half}}\033[0m │ \033[1;32m{b}\033[0m" for a, b in zip(left, right)]
 
 
-def caption(clips: queue.Queue, language: str, translate) -> None:
-    """The Tiiny writes each clip down; the row prints once its text is translated here."""
+def heard_as(text: str) -> str:
+    """"nl", "en" or "" (anything else): Latin script, then whose function words dominate."""
+    if not text or NON_LATIN.search(text):
+        return ""
+    words = re.findall(r"[a-zà-ÿ']+", text.lower())
+    nl, en, de = (sum(w in vocab for w in words) for vocab in (DUTCH, ENGLISH, GERMAN))
+    if en > nl and en > de:
+        return "en"
+    return "nl" if nl > de or (nl == de == 0 and len(words) < 4) else ""
+
+
+def caption(clips: queue.Queue, language: str, translate, fallback) -> None:
+    """The Tiiny writes each clip down; the row prints once its text is translated here.
+    The Tiiny ignores `language` and sometimes hears Flemish as German, Arabic or Persian: such a
+    clip is heard again here by Whisper with Dutch forced, slower but rare."""
     while True:
         pcm = clips.get()
         try:
             dutch = transcribe(pcm, language)
         except (RuntimeError, OSError) as e:
             print(f"\033[31m[Tiiny: {e}]\033[0m", flush=True)
+            dutch = ""
+        heard = heard_as(dutch)
+        if not heard:
+            dutch = fallback(pcm)
+        if not dutch:
             continue
-        if not dutch or CJK.search(dutch):  # noise comes back as Chinese
-            continue
-        english = translate(dutch)
+        english = dutch if heard == "en" else translate(dutch)  # someone spoke English
         for row in columns(dutch, english, shutil.get_terminal_size().columns):
             print(row, flush=True)
         print(flush=True)
@@ -127,11 +149,21 @@ def caption(clips: queue.Queue, language: str, translate) -> None:
             log.write(f"{time.strftime('%H:%M:%S')} NL {dutch}\n{time.strftime('%H:%M:%S')} EN {english}\n")
 
 
-def main(language: str, model: str) -> int:
+def main(language: str, model: str, whisper_model: str) -> int:
     from transformers import MarianMTModel, MarianTokenizer  # only the live path needs it
 
-    print(f"Loading {model}…", flush=True)
+    import numpy
+    from faster_whisper import WhisperModel
+
+    print(f"Loading {model} and Whisper {whisper_model}…", flush=True)
     tokenizer, marian = MarianTokenizer.from_pretrained(model), MarianMTModel.from_pretrained(model)
+    whisper = WhisperModel(whisper_model, device="cpu", compute_type="int8", cpu_threads=8)
+
+    def fallback(pcm: bytes) -> str:
+        audio = numpy.frombuffer(pcm, dtype=numpy.int16).astype(numpy.float32) / 32768
+        segments, _ = whisper.transcribe(audio, language=language or "nl", beam_size=1,
+                                         condition_on_previous_text=False, vad_filter=True)
+        return " ".join(s.text.strip() for s in segments)
 
     def translate(dutch: str) -> str:
         batch = tokenizer([dutch], return_tensors="pt", truncation=True)
@@ -149,7 +181,7 @@ def main(language: str, model: str) -> int:
     print(f"Listening (noise floor {floor:.0f}, speech above {chunker.threshold:.0f}). Ctrl+C stops.\n")
     LOG.parent.mkdir(parents=True, exist_ok=True)
     clips: queue.Queue = queue.Queue()
-    threading.Thread(target=caption, args=(clips, language, translate), daemon=True).start()
+    threading.Thread(target=caption, args=(clips, language, translate, fallback), daemon=True).start()
     try:
         while frame := read():
             if clip := chunker.feed(frame):
@@ -172,7 +204,13 @@ def selftest() -> None:
     rows = columns("een twee drie vier vijf zes", "one two", 24)
     assert len(rows) == 3 and all("│" in r for r in rows), "Dutch and English share rows"
     assert rows[0].index("│") == rows[2].index("│"), "the divider is aligned"
-    assert CJK.search("哎呀，我天哪！") and not CJK.search("Goedemiddag, allemaal.")
+    assert heard_as("Dat kan net zo goed bouwen zijn, daar kan je tafels leveren.") == "nl"
+    assert heard_as("Goedemiddag, allemaal.") == heard_as("Brussels Airport Company.") == "nl"
+    assert heard_as("Hi, I'm the chief officer at the company and this is our plan.") == "en"
+    assert heard_as("Das ist nicht so, und wir haben auch keine Zeit dafür.") == "", "German"
+    assert heard_as("las autoridades afirman que esto ha sido posible") == "", "Spanish"
+    assert heard_as("به دیزد.و در مورد این تکنیک") == "", "Persian"
+    assert heard_as("哎呀，我天哪！") == heard_as("مرحبا بكم") == "", "Chinese, Arabic"
     print("selftest ok")
 
 
@@ -180,6 +218,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--selftest", action="store_true")
     p.add_argument("--language", default="nl", help="spoken language hint for the Tiiny (it ignores it today)")
+    p.add_argument("--whisper", default="small", help="local model re-hearing a clip the box got wrong")
     p.add_argument("--door", help=f"HAI OS owner door URL (default: the line in {DOOR_FILE})")
     p.add_argument("--model", default="Helsinki-NLP/opus-mt-nl-en", help="translation model on this laptop")
     args = p.parse_args()
@@ -190,4 +229,4 @@ if __name__ == "__main__":
             DOOR = (args.door or DOOR_FILE.read_text()).strip().rstrip("/")
         except FileNotFoundError:
             sys.exit(f"No door: pass --door or write its URL into {DOOR_FILE}")
-        sys.exit(main(args.language, args.model))
+        sys.exit(main(args.language, args.model, args.whisper))
