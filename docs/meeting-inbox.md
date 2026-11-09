@@ -54,7 +54,7 @@ chat model either way, reached through the HAI OS owner door.
    written from the note, those readings and the draft. A photo that cannot be found or
    read is left out with a line on stderr. Photos go only to a model reached directly, never
    through the cloud purpose, which sends text alone. Nothing is written if the model
-   answers nothing or someone edited the note while it ran; the draft is then written
+   answers nothing, keeps less than a third of the draft, or someone edited the note while it ran; the draft is then written
    beside the note as usual. The note as it was is copied to the archive first, as
    `<M-DD-YY> before merge.md`. The notes are not checked against the transcript beyond
    the draft's own quotes: read them as a draft. The merge uses the same model and cloud

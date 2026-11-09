@@ -208,6 +208,17 @@ def merge_note(note: str, draft: str, photos: dict[str, str] | None = None) -> s
     return without_note(note, strip_markers(answer))
 
 
+#: The least of the draft's words a merge may keep. Told to write less than the draft, the
+#: Tiiny's Qwen3.6-35B once replaced a 480-word draft with the team note's one line (2026-11-09).
+KEPT_SHARE = 0.3
+
+
+def kept_enough(notes: str, draft: str) -> bool:
+    """Whether the merged notes are long enough to still hold the draft's content."""
+    draft = draft.split("\n## Said agreements", 1)[0]
+    return len(notes.split()) >= KEPT_SHARE * len(draft.split())
+
+
 def without_note(note: str, answer: str) -> str:
     """The answer minus a copy of the note it opens with: told not to, the Tiiny's
     Qwen3.6-35B still began with the whole note (2026-11-09), which the caller puts above."""
@@ -298,6 +309,9 @@ def merge_into(team: Path, draft: str, out: Path) -> bool:
         return False
     if not notes.strip():
         print(f"merge into {team.name} refused: the model wrote nothing", file=sys.stderr)
+        return False
+    if not kept_enough(notes, draft):
+        print(f"merge into {team.name} refused: the notes lost most of the draft", file=sys.stderr)
         return False
     if team.stat().st_mtime_ns != seen:
         print(f"merge into {team.name} refused: the note changed while merging", file=sys.stderr)
@@ -532,6 +546,8 @@ def selftest() -> None:
     assert without_note("---\nA\n---\nhi", "---\nA\n---\n\nhi\n\n## Summary\nx") == "## Summary\nx"
     assert without_note("---\nA\n---\nhi", "## Summary\n---\nA") == "## Summary\n---\nA"  # no copy
     assert without_note("hi\nthere", "hi\n## Summary") == "hi\n## Summary"  # a partial copy is kept
+    assert kept_enough("a b c", "w " * 10) and not kept_enough("a b", "w " * 10)
+    assert kept_enough("a b c", "w " * 10 + "\n## Said agreements\n" + "x " * 90)
     assert once_each("Hyper\nDyscic\nDyscic\n  Dyscic\n\n\nend") == "Hyper\nDyscic\n\n\nend"
     assert (root / "me" / "good 2026-10-21 10_30" / "10-21-26 before merge.md").read_text().endswith("![[board.jpg]]\n")
     # An empty answer is refused: the note stands and the draft lands beside it.
