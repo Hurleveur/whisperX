@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Live Dutch -> English captions from this laptop's microphone: Dutch left, English right.
 
-The mic is cut into utterances at pauses, or at the quietest moment of 12 s. Everything heavy runs
-on the home Tiiny, through the HAI OS owner door on the tailnet: Qwen3-ASR writes each clip down in
-Dutch, its chat model translates. This laptop's CPU only records and cuts: it is always busy, and
-Whisper on it was too slow or too poor (2026-11-09). The audio is saved beside the captions log.
+The mic is cut into utterances at pauses, or at the quietest moment of 12 s. Nothing heavy runs on
+this machine's CPU: it is always busy, and Whisper on it was too slow or too poor (2026-11-09).
+Each clip is written down by Whisper on this machine's NVIDIA GPU when it has one (the home
+laptop, run with the whisperX venv), else by the home Tiiny's Qwen3-ASR through the HAI OS owner
+door on the tailnet; the Tiiny's chat model translates either way. The audio is saved beside the
+captions log.
 
-    python3 scripts/live_translate.py               # Ctrl+C stops; stdlib only
+    python3 scripts/live_translate.py               # Ctrl+C stops; stdlib only, the Tiiny hears
+    .venv/bin/python scripts/live_translate.py      # the home laptop: its GPU hears
     python3 scripts/live_translate.py --door https://<box>.<tailnet>.ts.net:18710
     python3 scripts/live_translate.py --selftest
 """
@@ -159,16 +162,49 @@ def translate(dutch: str, model: str, before: str = "") -> str:
     return answer["choices"][0]["message"]["content"].strip()
 
 
-def hear(clips: queue.Queue, heard: queue.Queue, language: str) -> None:
-    """The Tiiny writes each clip down, 3 to 7 s per 12 s clip. It ignores `language` and now
-    and then hears Flemish as Chinese, Spanish or German: such a clip is dropped, never sent to
-    this laptop's CPU."""
+def asr_choice(asked: str, gpus: int) -> str:
+    """Which ASR writes the clips down: the GPU's Whisper when there is one, never this CPU."""
+    if asked == "gpu" and not gpus:
+        raise SystemExit("--asr gpu: no CUDA GPU here (run it with the whisperX venv's python)")
+    return asked if asked != "auto" else ("gpu" if gpus else "tiiny")
+
+
+def cuda_gpus() -> int:
+    try:
+        import ctranslate2  # the whisperX venv's; absent under the system python3
+    except ImportError:
+        return 0
+    return ctranslate2.get_cuda_device_count()
+
+
+def gpu_transcriber(language: str):
+    """faster-whisper on the GPU only. int8_float16 so large-v3-turbo fits beside the local
+    model's ~3.4 GB on the home laptop's 6 GB card (not yet measured there)."""
+    import numpy
+    from faster_whisper import WhisperModel
+
+    model = WhisperModel("large-v3-turbo", device="cuda", compute_type="int8_float16")
+    hot = Path.home() / ".local/share/whisperx/hotwords.txt"  # meeting.sh's names and terms
+    words = " ".join(hot.read_text().split()) if hot.is_file() else None
+
+    def transcribe_gpu(pcm: bytes, _: str = "") -> str:
+        audio = numpy.frombuffer(pcm, dtype=numpy.int16).astype(numpy.float32) / 32768
+        segments, _info = model.transcribe(audio, language=language or None, beam_size=5,
+                                           condition_on_previous_text=False, hotwords=words)
+        return " ".join(s.text.strip() for s in segments).strip()
+    return transcribe_gpu
+
+
+def hear(clips: queue.Queue, heard: queue.Queue, language: str, write=None) -> None:
+    """Writes each clip down: the GPU's Whisper (`write`), or the Tiiny, 3 to 7 s per 12 s
+    clip. The Tiiny ignores `language` and now and then hears Flemish as Chinese, Spanish or
+    German: such a clip is dropped, never sent to this machine's CPU."""
     while True:
         pcm = clips.get()
         try:
-            text = transcribe(pcm, language)
+            text = (write or transcribe)(pcm, language)
         except (RuntimeError, OSError) as e:
-            print(f"\033[31m[Tiiny transcription: {e}]\033[0m", flush=True)
+            print(f"\033[31m[transcription: {e}]\033[0m", flush=True)
             continue
         if lang := heard_as(text):
             heard.put((text, lang))
@@ -198,7 +234,9 @@ def caption(heard: queue.Queue, model: str) -> None:
             log.write(f"{time.strftime('%H:%M:%S')} NL {dutch}\n{time.strftime('%H:%M:%S')} EN {english}\n")
 
 
-def main(language: str, model: str) -> int:
+def main(language: str, model: str, asr: str) -> int:
+    asr = asr_choice(asr, cuda_gpus())
+    write = gpu_transcriber(language) if asr == "gpu" else None
     mic = subprocess.Popen(["pw-record", "--rate", str(RATE), "--channels", "1", "--format", "s16",
                             "--raw", "-"], stdout=subprocess.PIPE)
     assert mic.stdout is not None
@@ -215,7 +253,7 @@ def main(language: str, model: str) -> int:
         record.writeframes(frame)  # rewrites the header each time: a killed window leaves a valid file
         return frame
 
-    print(f"Saving the audio to {audio}", flush=True)
+    print(f"Hearing on the {'GPU (Whisper)' if write else 'Tiiny'}; saving the audio to {audio}", flush=True)
     # the quietest 100 ms of 2 s: people may already be talking when this starts
     floor = min(rms(read()) for _ in range(20))
     # 12 s, not 8: on room audio the box garbled more clips cut at 5 to 8 s (2026-11-09 A/B)
@@ -223,7 +261,7 @@ def main(language: str, model: str) -> int:
     print(f"Listening (noise floor {floor:.0f}, speech above {chunker.threshold:.0f}). Ctrl+C stops.\n")
     clips: queue.Queue = queue.Queue()
     heard: queue.Queue = queue.Queue()
-    threading.Thread(target=hear, args=(clips, heard, language), daemon=True).start()
+    threading.Thread(target=hear, args=(clips, heard, language, write), daemon=True).start()
     threading.Thread(target=caption, args=(heard, model), daemon=True).start()
     try:
         while frame := read():
@@ -262,6 +300,13 @@ def selftest() -> None:
     assert heard_as("literalmente para") == heard_as("abbiamo detto.") == "", "short Spanish, Italian"
     assert heard_as("Dank u wel.") == "nl"
     assert heard_as("به دیزد.و در مورد این تکنیک") == "", "Persian"
+    assert asr_choice("auto", 1) == "gpu" and asr_choice("auto", 0) == "tiiny"
+    assert asr_choice("tiiny", 1) == "tiiny"
+    try:
+        asr_choice("gpu", 0)
+        raise AssertionError("no GPU: --asr gpu refuses, never this CPU")
+    except SystemExit:
+        pass
     assert heard_as("哎呀，我天哪！") == heard_as("مرحبا بكم") == "", "Chinese, Arabic"
     print("selftest ok")
 
@@ -269,7 +314,9 @@ def selftest() -> None:
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--selftest", action="store_true")
-    p.add_argument("--language", default="nl", help="spoken language hint for the Tiiny (it ignores it today)")
+    p.add_argument("--language", default="nl", help="spoken language (Whisper holds to it; the Tiiny ignores it today)")
+    p.add_argument("--asr", choices=("auto", "gpu", "tiiny"), default="auto",
+                   help="who writes the Dutch down: this machine's CUDA GPU, else the Tiiny (auto)")
     p.add_argument("--door", help=f"HAI OS owner door URL (default: the line in {DOOR_FILE})")
     p.add_argument("--model", default="box/tiiny/Qwen/Qwen3.6-35B-A3B", help="chat model translating on the box")
     args = p.parse_args()
@@ -280,4 +327,4 @@ if __name__ == "__main__":
             DOOR = (args.door or DOOR_FILE.read_text()).strip().rstrip("/")
         except FileNotFoundError:
             sys.exit(f"No door: pass --door or write its URL into {DOOR_FILE}")
-        sys.exit(main(args.language, args.model))
+        sys.exit(main(args.language, args.model, args.asr))
