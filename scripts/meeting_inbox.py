@@ -14,6 +14,7 @@ do the work, so two boxes sharing it never both take a recording.
 """
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -22,9 +23,13 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+DOOR_FILE = Path.home() / ".config/hai/door"  # one line: the owner door's https URL
+#: The tier hai-os ships this job on (background/jobs.toml): whichever model the box runs.
+ANY_BOX = "ctx-any-local"
 TRANSCRIPTS = REPO / "transcripts"  # where meeting.sh writes
 # .mp4 and .webm: what WhatsApp and browsers save a voice recording as.
 AUDIO = {".m4a", ".wav", ".mp3", ".mp4", ".webm", ".ogg", ".opus", ".flac", ".aac"}
@@ -58,12 +63,40 @@ def pending(inbox: Path) -> list[Path]:
     return found
 
 
+def running_box_model(door: str, listing: dict | None = None) -> str:
+    """The chat model running on the owner's box, from the door's /v1/models."""
+    if listing is None:
+        with urllib.request.urlopen(f"{door}/v1/models", timeout=10) as resp:
+            listing = json.load(resp)
+    assert listing is not None
+    running = [m["id"] for m in listing.get("data", []) if (m.get("hai_box") or {}).get("loaded")]
+    if not running:
+        raise SystemExit("no chat model runs on the owner's box (unplugged, locked or none loaded)")
+    return running[0]
+
+
 def llm_env() -> dict[str, str]:
     """The environment meeting.sh drafts with, which the merge uses too."""
     env = {**os.environ}
     # large-v2 is meeting.sh's default; turbo is the speed/accuracy trade for a job
     # that owns the GPU for the duration.
     env.setdefault("WHISPER_MODEL", "large-v3-turbo")
+    # The Background panel's pick (the runner's HAI_JOB_MODEL): a model on the owner's
+    # box, named (`box/<box>/<model>`) or whichever runs there (`ctx-any-local`), asked
+    # through the owner door, which answers any of his boxes on the tailnet by its
+    # Tailscale identity: no bearer token goes there, the transcript never leaves his
+    # machines, and unlike hai-context's own `any-local` it never falls back to this
+    # box's CPU model, so a box that is off fails the run and the next one retries.
+    picked = env.get("HAI_JOB_MODEL", "")
+    if picked.startswith("box/") or picked == ANY_BOX:
+        door = DOOR_FILE.read_text().strip().rstrip("/")
+        env.setdefault("LLM_API", "openai")
+        env.setdefault("LLM_HOST", f"{door}/v1")
+        env.setdefault("LLM_MODEL", picked if picked != ANY_BOX else running_box_model(door))
+        env.setdefault("LLM_TOKEN_FILE", "")
+        env.setdefault("LLM_ESCALATE", "")
+    elif picked:
+        raise SystemExit(f"meeting-inbox drafts on a box model ({ANY_BOX} or box/...), not {picked!r}")
     # hai-context's local model, the only one a background job may use. The bearer
     # token is read from this file by analyze_meeting.py, never passed on a command line.
     env.setdefault("LLM_API", "openai")
@@ -378,6 +411,30 @@ def selftest() -> None:
     tmp = Path(tempfile.mkdtemp())
     inbox, root, TRANSCRIPTS = tmp / "meetings", tmp / "rec", tmp / "tr"
     inbox.mkdir()
+    global DOOR_FILE
+    DOOR_FILE = tmp / "door"
+    DOOR_FILE.write_text("https://door.example:1/\n")
+    os.environ["HAI_JOB_MODEL"] = "box/tiiny/Qwen/Qwen3.6-35B-A3B"
+    env = llm_env()
+    assert (env["LLM_HOST"], env["LLM_MODEL"]) == ("https://door.example:1/v1", "box/tiiny/Qwen/Qwen3.6-35B-A3B")
+    assert env["LLM_TOKEN_FILE"] == env["LLM_ESCALATE"] == "", "no token to the door, no cloud"
+    os.environ["HAI_JOB_MODEL"] = "sonnet"
+    try:
+        llm_env()
+        raise AssertionError("a pick it cannot use is refused, not ignored")
+    except SystemExit:
+        pass
+    del os.environ["HAI_JOB_MODEL"]
+    assert llm_env()["LLM_MODEL"] == "hai-local"
+    listing = {"data": [{"id": "local", "hai_own": {}},
+                        {"id": "box/t/a", "hai_box": {"loaded": False}},
+                        {"id": "box/t/b", "hai_box": {"loaded": True}}]}
+    assert running_box_model("", listing) == "box/t/b"
+    try:
+        running_box_model("", {"data": listing["data"][:2]})
+        raise AssertionError("nothing running on the box: the run fails, never this box's own model")
+    except SystemExit:
+        pass
     for name in ["m [1].m4a", "notes.md", "bad.wav", "voice.mp4"]:
         f = inbox / name
         f.write_bytes(b"x")

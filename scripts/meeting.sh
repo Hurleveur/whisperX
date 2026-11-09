@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Audio file -> diarized whisperX transcript -> meeting notes from a local LLM.
+# Audio file -> transcript (the home Tiiny, or diarized whisperX) -> meeting notes from an LLM.
 # Run with no arguments for usage.
 set -euo pipefail
 
@@ -9,24 +9,29 @@ usage() {
     cat >&2 <<EOF
 usage: meeting.sh [options] <audio-file> [extra whisperx args...]
 
-Audio file -> diarized whisperX transcript -> meeting notes from a local LLM.
-Writes transcripts/<name>.{json,srt,txt,tsv,vtt} and
+Audio file -> transcript -> meeting notes from an LLM. The transcript is
+written by the home Tiiny's Qwen3-ASR through the HAI OS owner door, with no
+speaker labels and nothing heavy on this machine; ASR=whisperx runs diarized
+whisperX here instead. Writes transcripts/<name>.json and .txt (whisperX also
+.srt, .tsv, .vtt) and
 transcripts/<name>-notes/{part-NN.md,summary.md}.
 
 Options (must come before the audio file):
   --copy-to DEST   also copy summary.md to DEST. A directory gets <name>.md,
                    a path ending in .md is used literally. The originals stay
                    in transcripts/ either way.
-  --speakers MAP   rename diarization labels, comma-separated LABEL=Name pairs:
+  --speakers MAP   (ASR=whisperx) rename diarization labels, comma-separated LABEL=Name pairs:
                    "SPEAKER_01=Alice,SPEAKER_02=Bob". Which label is who is
                    only visible in the transcript, so run once, skim
                    transcripts/<name>.txt, then re-run with the mapping.
                    Without it, voices enrolled with scripts/voices.py are
                    recognised and named automatically.
-  --transcribe-only  stop after whisperX, before the LLM draft.
+  --transcribe-only  stop after the transcript, before the LLM draft.
   -h, --help       this message.
 
 Environment:
+  ASR              tiiny (default: scripts/tiiny_transcribe.py, door URL in
+                   ~/.config/hai/door) or whisperx (on this machine)
   WHISPER_MODEL    whisper model (default: large-v2)
   BATCH_SIZE       whisperX batch size (default: 4; lower it if VRAM is tight)
   WHISPER_HOTWORDS_FILE  words whisper should expect, such as product and
@@ -37,8 +42,8 @@ Environment:
   LLM_HOST         default: localhost:11434 (ollama), localhost:1234/v1 (openai)
   LLM_MODEL        default: nemotron-3-nano:4b; required when LLM_API=openai
 
-Anything after the audio file goes to whisperX, e.g. --language fr.
-Re-running skips transcription when the .json already exists, and skips any
+Anything after the audio file goes to whisperX, e.g. --language fr (the Tiiny
+takes none). Re-running skips transcription when the .json already exists, and skips any
 chunk already written to transcripts/<name>-notes/. Delete those to force a
 redo after changing the template.
 
@@ -76,29 +81,31 @@ out=$repo/transcripts
 name=$(basename "$audio")
 json="$out/${name%.*}.json"
 
-# On x86_64 the pinned torch is the CUDA build whether or not the machine has a
-# GPU, so the nvidia wheels being present proves nothing: ask torch instead.
-if [ "$("$repo/.venv/bin/python" -c 'import torch; print(int(torch.cuda.is_available()))')" = 1 ]; then
-    # whisperX pulls its own cuDNN/cuBLAS in as pip wheels, and nothing puts them on
-    # the linker path: without this the CUDA backend dies with
-    # "Unable to load any of {libcudnn_cnn.so.9...}" mid-run.
-    nv=$(echo "$repo"/.venv/lib/python*/site-packages/nvidia)
-    export LD_LIBRARY_PATH="$nv/cudnn/lib:$nv/cublas/lib:$nv/cuda_runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-    compute=float16
-else
-    # float16 is a GPU format, and whisperX's CPU default of float32 costs hours on
-    # a long recording for no accuracy worth having.
-    compute=int8
-fi
-
-# Kept out of git: the list names this box's people and projects.
-hotwords_file=${WHISPER_HOTWORDS_FILE:-$HOME/.local/share/whisperx/hotwords.txt}
-hot=()
-if [ -s "$hotwords_file" ]; then hot=(--hotwords "$(tr '\n' ' ' < "$hotwords_file")"); fi
-
 if [ -f "$json" ]; then
-    echo "transcript already there, skipping whisperX: $json" >&2
+    echo "transcript already there, skipping transcription: $json" >&2
+elif [ "${ASR:-tiiny}" = tiiny ]; then
+    "$repo/.venv/bin/python" "$repo/scripts/tiiny_transcribe.py" "$audio" "$out" >/dev/null
 else
+    # On x86_64 the pinned torch is the CUDA build whether or not the machine has a
+    # GPU, so the nvidia wheels being present proves nothing: ask torch instead.
+    if [ "$("$repo/.venv/bin/python" -c 'import torch; print(int(torch.cuda.is_available()))')" = 1 ]; then
+        # whisperX pulls its own cuDNN/cuBLAS in as pip wheels, and nothing puts them on
+        # the linker path: without this the CUDA backend dies with
+        # "Unable to load any of {libcudnn_cnn.so.9...}" mid-run.
+        nv=$(echo "$repo"/.venv/lib/python*/site-packages/nvidia)
+        export LD_LIBRARY_PATH="$nv/cudnn/lib:$nv/cublas/lib:$nv/cuda_runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        compute=float16
+    else
+        # float16 is a GPU format, and whisperX's CPU default of float32 costs hours on
+        # a long recording for no accuracy worth having.
+        compute=int8
+    fi
+
+    # Kept out of git: the list names this box's people and projects.
+    hotwords_file=${WHISPER_HOTWORDS_FILE:-$HOME/.local/share/whisperx/hotwords.txt}
+    hot=()
+    if [ -s "$hotwords_file" ]; then hot=(--hotwords "$(tr '\n' ' ' < "$hotwords_file")"); fi
+
     # A run that dies with no traceback is usually the OOM killer: earlyoom takes
     # this out around 3.5 GB RSS when free RAM runs low.
     "$repo/.venv/bin/whisperx" "$audio" \

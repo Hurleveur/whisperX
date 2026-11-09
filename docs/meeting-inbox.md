@@ -2,7 +2,10 @@
 
 Drop an audio file in a meetings folder you chose. The box that watches it transcribes
 it, drafts the notes beside it, and moves the audio out to an archive;
-`scripts/meeting_inbox.py` does this when the hai-os job runner calls it.
+`scripts/meeting_inbox.py` does this when the hai-os job runner calls it. Both the
+transcription and the draft run on the owner's inference box (the home Tiiny), reached
+through the HAI OS owner door, so the machine that runs the job does no heavy work. The
+transcript has no speaker labels for now: the box has no diarization yet.
 
 1. **Choose the folder, on one box.** Set `MEETINGS_INBOX` to the folder's path in the
    job's environment. Under hai-os that is this machine's `background/jobs.local.toml`
@@ -23,13 +26,16 @@ it, drafts the notes beside it, and moves the audio out to an archive;
    its modification time when the job picks it up, `Recording 2026-10-21 10_30.m4a`, so
    each recording gets its own transcript and archive folder. A name already taken in
    the folder or the archive gets a number.
-3. **Wait.** The job runs only while the box is idle and on mains power, and takes up
-   to an hour per recording.
+3. **Wait.** The job runs only while the machine is idle and on mains power. The Tiiny
+   transcribes at about half real time (a 4-minute recording took 2 minutes, 2026-11-09),
+   then drafts. It serves one request at a time, so the job waits while you are at the
+   machine, where you may be using the box yourself. If the box is off or locked the run
+   fails and the next run resumes from the clip it reached.
 4. **Find the result.** `<M-DD-YY> <HH>h<MM> draft.md` and `... transcript.md` appear in
    the meetings folder, dated from the recording's file name (or its modification
    time); a name already taken gets a number, so a note is never written over. The
-   audio leaves the folder: it is moved, with the whisperX files (`.json .txt .srt .vtt
-   .tsv`) and `summary.md` (the draft as made), to the archive
+   audio leaves the folder: it is moved, with the transcript files (`.json .txt`, and
+   `.srt .vtt .tsv` from whisperX) and `summary.md` (the draft as made), to the archive
    `$HAI_RECORDINGS/<this box's hostname>/<recording name>/` (default
    `~/Documents/GitHub/hai-os/.hai-shared/recordings`). A recording still in the folder
    is unfinished and is retried; one whose archive already holds `summary.md` is only
@@ -53,6 +59,9 @@ it, drafts the notes beside it, and moves the audio out to an archive;
    the draft's own quotes: read them as a draft. The merge uses the same model and cloud
    purpose as the draft, so with a cloud purpose set the team's note leaves the box for
    that call too. The merged notes are kept shorter than the draft, and the draft's `Said agreements` section stays in the archived `summary.md` rather than the note.
+Steps 5 and 6 apply only to a transcript made with `ASR=whisperx` (diarized whisperX on the
+machine itself, set in the job's environment); the Tiiny's transcript has no speakers to name.
+
 5. **Name the speakers and redo the draft.** Voices enrolled earlier are named
    automatically (step 6). For anyone else, read the `.txt`, note which `SPEAKER_NN`
    is who, then on the processing box, from the whisperX checkout:
@@ -84,7 +93,8 @@ Decisions, action items and open questions in the draft each end with the words 
 settled or raised them, in quotes. `analyze_meeting.py` deletes any such bullet whose
 quote is not in the transcript, so a decision the model inferred never reaches the
 notes. An action item also opens with its owner as a tag (`#Alice`), and the quote must
-be words that owner said; one without an owner, or quoting someone else, is deleted.
+be words that owner said when the transcript names its speakers; one without an owner,
+or quoting someone else, is deleted.
 The draft keeps what the team will need a month later: the summary is capped at 400 words (`MEETING_SUMMARY_WORDS`), and a last call picks, by number, which decisions, action items and open questions to keep (at most five questions), so the day's logistics drop out without a kept bullet being reworded. A last section, `Said agreements`, is plain code: every transcript line voicing an
 agreement ("je suis d'accord", "on s'est mis d'accord", "agreed"), with the two lines
 before it, verbatim. It finds what the model loses and invents nothing.
@@ -94,17 +104,25 @@ not checked at all: read the draft as a rough index of the transcript, not as th
 
 ## What the processing box needs
 
-- This checkout with `.venv` (`uv sync`), and the `large-v3-turbo` weights (downloaded on first use).
-- A Hugging Face token the pyannote diarization models accept, as `HF_TOKEN` in the
-  job's environment or in the `huggingface_hub` login cache, with the gated model terms accepted.
-- hai-context running on `127.0.0.1:18701` and a bearer token in `~/.config/hai/tokens/scheduler`
-  (`LLM_TOKEN_FILE` overrides the path). Drafting goes out on hai-context's `meeting` cloud
-  purpose (Gemma 4 31B on a zero-data-retention OpenRouter endpoint, metered under your
-  caps, about $0.02 for an hour of meeting): the transcript leaves the box for that call.
-  `LLM_ESCALATE=` (empty) keeps it on the local model `hai-local` instead.
+- This checkout with `.venv` (`uv sync`), and `ffmpeg` on the path (it decodes the recording).
+- The owner door's https URL on one line in `~/.config/hai/door`, and the Tiiny plugged in
+  and unlocked on the box behind it, with Qwen3-ASR and a chat model installed.
+- The draft's model is the `meeting-inbox` row's model picker in the cockpit's Background
+  panel (`HAI_JOB_MODEL`): by default **any loaded, box first** (`ctx-any-local`),
+  whichever chat model the box runs, or a `box/...` model named there. Either is asked
+  through the door, so the transcript never leaves your own machines; with no model
+  running on the box the run fails rather than fall back to this machine's own model.
+  Run by hand with no `HAI_JOB_MODEL`, the draft goes to hai-context on
+  `127.0.0.1:18701` (bearer token in `~/.config/hai/tokens/scheduler`, `LLM_TOKEN_FILE`
+  overrides the path) on its `meeting` cloud purpose (Gemma 4 31B on a zero-data-retention
+  OpenRouter endpoint, about $0.02 for an hour of meeting), or with `LLM_ESCALATE=`
+  (empty) on its local model `hai-local`.
+- For `ASR=whisperx` only: the `large-v3-turbo` weights (downloaded on first use) and a
+  Hugging Face token the pyannote diarization models accept, as `HF_TOKEN` in the job's
+  environment or in the `huggingface_hub` login cache, with the gated model terms accepted.
 - When the job finishes a recording it leaves a quiet row in the cockpit's Activity
   ("Meeting notes drafted: 10-21-26 11h30"), with no popup on the avatar.
-- `WHISPER_MODEL`, `LLM_API`, `LLM_HOST`, `LLM_MODEL` in the environment override the defaults.
-- Optionally, the names whisper keeps mishearing (people, products, project names),
+- `ASR`, `WHISPER_MODEL`, `LLM_API`, `LLM_HOST`, `LLM_MODEL` in the environment override the defaults.
+- Optionally, the names the transcript keeps mishearing (people, products, project names),
   comma-separated in `~/.local/share/whisperx/hotwords.txt` (`WHISPER_HOTWORDS_FILE`
-  overrides the path). The notes are told to spell them that way too. It stays on the box, like the voices.
+  overrides the path). The notes are told to spell them that way; only whisperX also listens for them. It stays on the box, like the voices.
