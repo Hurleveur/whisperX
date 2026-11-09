@@ -147,6 +147,9 @@ def merge_note(note: str, draft: str, photos: dict[str, str] | None = None) -> s
     the caller."""
     import analyze_meeting  # beside this script; only a merge needs it
 
+    # Said agreements are verbatim lines kept for checking ("Agreed?"), noise in the team's
+    # note; they stay in the archived summary.md.
+    draft = draft.split("\n## Said agreements", 1)[0].strip()
     shown = "".join(f"--- PHOTO {name} ---\n{text}\n--- END PHOTO ---\n\n"
                     for name, text in (photos or {}).items())
     answer = analyze_meeting.generate(
@@ -157,10 +160,13 @@ def merge_note(note: str, draft: str, photos: dict[str, str] | None = None) -> s
         f"{shown}"
         f"--- DRAFT FROM THE RECORDING ---\n{draft}\n--- END DRAFT ---\n\n"
         "Rules. The team note stays above your answer exactly as it is: do not copy it. "
-        "Write the meeting notes that go under it: everything the draft says, worked "
-        "together with what the team note and the photos add, in the draft's headings. "
-        + ("Add a section `## From the photos`: for each photo, what it shows and how it "
-           "ties to what was said. " if shown else "")
+        "Write the meeting notes that go under it, under the draft's own headings, starting "
+        "with `## Summary`: what the team will still need in a month, worked together "
+        "with what the team note and the photos add. Shorter than the draft, never longer. Cut what the draft kept that has no "
+        "use later: the day's logistics, small talk, anecdotes, demo narration. "
+        + ("Add a section `## From the photos`: for each photo, two or three sentences on "
+           "the ideas it holds and how they tie to what was said; never list every word "
+           "on it. " if shown else "")
         + "Where the team note names the people, write a name in place of a SPEAKER label "
         "only when the note and the draft make clear who it is. Keep the draft's quotes "
         "exactly. Write in the team note's language. Output the notes only.",

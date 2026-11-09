@@ -52,7 +52,7 @@ it, drafts the notes beside it, and moves the audio out to an archive;
    `<M-DD-YY> before merge.md`. The notes are not checked against the transcript beyond
    the draft's own quotes: read them as a draft. The merge uses the same model and cloud
    purpose as the draft, so with a cloud purpose set the team's note leaves the box for
-   that call too.
+   that call too. The merged notes are kept shorter than the draft, and the draft's `Said agreements` section stays in the archived `summary.md` rather than the note.
 5. **Name the speakers and redo the draft.** Voices enrolled earlier are named
    automatically (step 6). For anyone else, read the `.txt`, note which `SPEAKER_NN`
    is who, then on the processing box, from the whisperX checkout:
@@ -85,7 +85,7 @@ settled or raised them, in quotes. `analyze_meeting.py` deletes any such bullet 
 quote is not in the transcript, so a decision the model inferred never reaches the
 notes. An action item also opens with its owner as a tag (`#Alice`), and the quote must
 be words that owner said; one without an owner, or quoting someone else, is deleted.
-A last section, `Said agreements`, is plain code: every transcript line voicing an
+The draft keeps what the team will need a month later: the summary is capped at 400 words (`MEETING_SUMMARY_WORDS`), and a last call picks, by number, which decisions, action items and open questions to keep (at most five questions), so the day's logistics drop out without a kept bullet being reworded. A last section, `Said agreements`, is plain code: every transcript line voicing an
 agreement ("je suis d'accord", "on s'est mis d'accord", "agreed"), with the two lines
 before it, verbatim. It finds what the model loses and invents nothing.
 
@@ -107,4 +107,4 @@ not checked at all: read the draft as a rough index of the transcript, not as th
 - `WHISPER_MODEL`, `LLM_API`, `LLM_HOST`, `LLM_MODEL` in the environment override the defaults.
 - Optionally, the names whisper keeps mishearing (people, products, project names),
   comma-separated in `~/.local/share/whisperx/hotwords.txt` (`WHISPER_HOTWORDS_FILE`
-  overrides the path). It stays on the box, like the voices.
+  overrides the path). The notes are told to spell them that way too. It stays on the box, like the voices.

@@ -31,6 +31,10 @@ DEFAULT_TEMPLATE = """# Meeting notes
 ## Open questions
 """
 
+#: The merged summary's ceiling. Uncapped, the Tiiny's Qwen3.6-35B wrote 2,000 words
+#: for a 12,000-word meeting, most of it the day's logistics and demo narration (2026-11-09).
+SUMMARY_WORDS = 400
+
 TIMESTAMP = re.compile(r"^(\d+$|\d\d:\d\d:\d\d[.,]\d+ --> |WEBVTT)")
 
 
@@ -242,11 +246,57 @@ def keep_quoted(md: str, source: str) -> tuple[str, list[str]]:
                 continue
             seen.add((section, *claim))
         kept.append(line)
-    out = "\n".join(kept)
-    # A checked heading followed only by blank lines up to the next heading or the end.
+    return without_empty("\n".join(kept)), dropped
+
+
+def without_empty(md: str) -> str:
+    """`md` minus each checked heading followed only by blank lines up to the next
+    heading or the end."""
     names = "|".join(re.escape(c) for c in CHECKED)
-    out = re.sub(rf"^#+\s+(?:{names})[^\n]*(?:\n\s*)*(?=#|\Z)", "", out, flags=re.M | re.I)
-    return out.strip(), dropped
+    return re.sub(rf"^#+\s+(?:{names})[^\n]*(?:\n\s*)*(?=#|\Z)", "", md, flags=re.M | re.I).strip()
+
+
+#: Open questions kept after keep_lasting; more is a list nobody reads.
+MAX_QUESTIONS = 5
+
+
+def keep_lasting(md: str, args) -> str:
+    """`md` minus the Decisions / Action items / Open questions bullets the team will not
+    need later: the model only picks numbers, so a kept bullet and its quote are never
+    reworded. Every part's decisions came back uncut and half were the day's logistics
+    ("the tender talk starts at 1:30", 2026-11-09). An answer with no number keeps all."""
+    bullets, section, lines = [], None, md.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r"^#+\s+(.+?)\s*$", line)
+        if m:
+            section = m.group(1).strip().lower()
+        elif re.match(r"^\s*[-*]\s", line) and section and section.startswith(CHECKED):
+            bullets.append((i, section))
+    if not bullets:
+        return md
+    listed = "\n".join(f"{n}. [{s}] {lines[i].strip()[2:]}" for n, (i, s) in enumerate(bullets, 1))
+    answer = generate(
+        f"--- NUMBERED BULLETS FROM ONE MEETING'S NOTES ---\n{listed}\n--- END ---\n\n"
+        f"Pick the bullets the team still needs a month from now: a choice about the "
+        f"product, the project or how they work; work someone owes after the meeting; a "
+        f"question that blocks work. Leave out: the day's logistics (travel, times, "
+        f"tickets, which file format to send), anything done before the notes are read, "
+        f"remarks, a bullet saying the same as another, a bullet that reads as nonsense. "
+        f"At most {MAX_QUESTIONS} open questions. Answer with the numbers to keep, "
+        f"comma-separated, nothing else.",
+        args,
+        limit=400,
+    )
+    keep = {int(n) for n in re.findall(r"\d+", answer) if 0 < int(n) <= len(bullets)}
+    if not keep:
+        return md
+    asked, drop = 0, set()
+    for n, (i, section) in enumerate(bullets, 1):
+        if n in keep and section.startswith("open questions"):
+            asked += 1
+        if n not in keep or (section.startswith("open questions") and asked > MAX_QUESTIONS):
+            drop.add(i)
+    return without_empty("\n".join(l for i, l in enumerate(lines) if i not in drop))
 
 
 # Words that say something was agreed, in the languages these meetings are held in.
@@ -397,6 +447,7 @@ def main() -> None:
         if names
         else ""
     )
+    roster += glossary()
     text = read_transcript(args.transcript, names)
     parts = chunk(text, args.chunk_chars)
     # The tags keep_quoted accepts, so the model writes #Alice and not "Alice:".
@@ -432,7 +483,8 @@ def main() -> None:
             f"right beats long and invented. Transcript is machine-made and garbles "
             f"words: passage makes no sense - drop it, never repeat nonsense. Every "
             f"decision, action item and open question ends with the speaker's exact words "
-            f"in double quotes, copied from the transcript in its own language. No exact "
+            f"in double quotes, one unbroken stretch copied from the transcript in its own "
+            f"language, never cut with '...'. No exact "
             f"words - no bullet. Action item starts with the tag of the person who "
             f"committed ({owners}) and quotes that person. No owner - no bullet. "
             f"Third person. Never 'you' or "
@@ -458,9 +510,22 @@ def main() -> None:
     merged, dropped = keep_quoted(merged, "\n".join(parts))
     for line in dropped:
         print(f"  merge: dropped, quote no longer matched: {line}", file=sys.stderr)
+    merged = keep_lasting(merged, args)
     merged = "\n\n".join(filter(None, [merged, agreements(text)]))
     (out / "summary.md").write_text(merged + "\n")
     print(out / "summary.md")
+
+
+def glossary() -> str:
+    """The prompt line naming the words whisper is told to expect (meeting.sh's hotwords
+    file): whisper still wrote "Hydrocampus" for Hypercampus, and the notes kept it
+    (2026-11-09). Empty when the file is absent."""
+    hot = pathlib.Path(os.environ.get("WHISPER_HOTWORDS_FILE") or "~/.local/share/whisperx/hotwords.txt")
+    hot = hot.expanduser()
+    terms = ", ".join(w.strip() for w in re.split(r"[,\n]", hot.read_text()) if w.strip()) if hot.is_file() else ""
+    return (f"Names and terms, spelled so: {terms}. A garbled word that sounds like one of "
+            f"them is that term, except inside quotes, which stay as the transcript has them. "
+            if terms else "")
 
 
 def template_headings(template: str) -> list[str]:
@@ -542,6 +607,7 @@ def merge(notes: list[str], template: str, roster: str, args) -> str:
     preamble = template.split("## ", 1)[0].strip()
     tpl_summary, tpl_bullets = split_summary(template, head)
 
+    cap = int(os.environ.get("MEETING_SUMMARY_WORDS") or SUMMARY_WORDS)
     narrative = generate(
         f"--- SUMMARIES FROM {n} PARTS OF ONE MEETING ---\n{summaries}\n--- END ---\n\n"
         f"Write the summary of the whole meeting.\n\n{preamble}\n\n"
@@ -551,9 +617,10 @@ def merge(notes: list[str], template: str, roster: str, args) -> str:
         # loud and never wrote the summary.
         f"Rules. {roster}Write the finished summary. Never explain your work, never "
         f"list the parts, never think out loud. Every fact comes from the summaries "
-        f"above. Never add a fact. Cover all {n} parts. Organise by topic, not by "
-        f"part. A part that covered four topics becomes four paragraphs. Two parts on "
-        f"one topic become one paragraph. Never copy a part summary as a paragraph. "
+        f"above. Never add a fact. Keep only what matters a month from now; cut the "
+        f"rest even when a part spent long on it. At most {cap} words. "
+        f"Organise by topic, not by part. Two parts on one topic become one paragraph. "
+        f"Never copy a part summary as a paragraph. "
         f"Blank line between paragraphs. Never one block. Never open a paragraph with "
         f"'The meeting'. Third person. Never 'you' or 'I'. Never pad. No heading.\n\n"
         f"The summary starts on the next line.\n",
@@ -576,7 +643,8 @@ def merge(notes: list[str], template: str, roster: str, args) -> str:
             f"meeting - delete; rhetorical question - delete; procedural chatter - "
             f"delete; question nobody has to act on - delete; bullet that reads as "
             f"nonsense - delete. Then merge what is left: one bullet per real thing, "
-            f"even when parts word it differently. Never invent a bullet. Third "
+            f"even when parts word it differently. At most five open questions: keep "
+            f"the ones that block the most work. Never invent a bullet. Third "
             f"person. Never 'you' or 'I'. Section with nothing left - delete that "
             f"heading. Never write 'none'. Output headings and bullets only. No "
             f"summary paragraph.",
@@ -600,6 +668,23 @@ def merge(notes: list[str], template: str, roster: str, args) -> str:
 
 
 def selftest() -> None:
+    global generate
+    real, notes = generate, "## Summary\nx\n\n## Decisions\n- a\n- b\n\n## Open questions\n" + "".join(
+        f"- q{i}\n" for i in range(7))
+    generate = lambda *a, **k: "1, 3, 4, 5, 6, 7, 8, 9"
+    kept = keep_lasting(notes, None)
+    assert "- a" in kept and "- b" not in kept and "## Summary\nx" in kept, kept
+    assert [l for l in kept.splitlines() if l.startswith("- q")] == [f"- q{i}" for i in range(5)], kept
+    generate = lambda *a, **k: "2"
+    assert "## Open questions" not in keep_lasting(notes, None) and "- b" in keep_lasting(notes, None)
+    generate = lambda *a, **k: "none of them"
+    assert keep_lasting(notes, None) == notes
+    generate = real
+    os.environ["WHISPER_HOTWORDS_FILE"] = "/tmp/_hot.txt"
+    pathlib.Path("/tmp/_hot.txt").write_text("Alice, Hypercampus\nPod\n")
+    assert "spelled so: Alice, Hypercampus, Pod." in glossary()
+    os.environ["WHISPER_HOTWORDS_FILE"] = "/tmp/_absent.txt"
+    assert glossary() == ""
     assert chunk("a\nb\nc\n", 4) == ["a\nb\n", "c\n"]
     assert chunk("", 10) == []
     assert "".join(chunk("x" * 50, 7)) == "x" * 50
