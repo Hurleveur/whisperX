@@ -34,7 +34,10 @@ chat model either way, reached through the HAI OS owner door.
    fails and the next run resumes from the clip it reached.
 4. **Find the result.** `<M-DD-YY> <HH>h<MM> draft.md` and `... transcript.md` appear in
    the meetings folder, dated from the recording's file name (or its modification
-   time); a name already taken gets a number, so a note is never written over. The
+   time); a name already taken gets a number, so a note is never written over. When the
+   meetings folder is shared with a team, put the transcripts in a private folder of your
+   own: set `MEETINGS_TRANSCRIPTS` to its path in the same `[jobs.meeting-inbox.env]`
+   table, and the `... transcript.md` goes there instead of beside the notes. The
    audio leaves the folder: it is moved, with the transcript files (`.json .txt`, and
    `.srt .vtt .tsv` from whisperX) and `summary.md` (the draft as made), to the archive
    `$HAI_RECORDINGS/<this box's hostname>/<recording name>/` (default

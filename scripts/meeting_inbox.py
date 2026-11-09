@@ -49,6 +49,13 @@ def inbox_dir() -> Path | None:
     return Path(value).expanduser() if value else None
 
 
+def transcripts_dir(inbox: Path) -> Path:
+    """Where a recording's transcript goes: `MEETINGS_TRANSCRIPTS`, or beside the notes. A
+    team folder synced to a shared pod would hand every word said to everyone in it."""
+    value = os.environ.get("MEETINGS_TRANSCRIPTS")
+    return Path(value).expanduser() if value else inbox
+
+
 def pending(inbox: Path) -> list[Path]:
     """Audio in the inbox old enough to have finished recording or syncing in."""
     now = time.time()
@@ -337,7 +344,8 @@ def publish(audio: Path, out: Path) -> str:
         shutil.copy2(f, out / f.name)
     # Never over an existing note: two recordings of one minute, or a draft already edited.
     base, n, name = note_name(audio), 2, note_name(audio)
-    while (audio.parent / f"{name} draft.md").exists() or (audio.parent / f"{name} transcript.md").exists():
+    said = transcripts_dir(audio.parent)
+    while (audio.parent / f"{name} draft.md").exists() or (said / f"{name} transcript.md").exists():
         name, n = f"{base} {n}", n + 1
     team = audio.parent / f"{base.split()[0]}.md"
     if team.is_file() and merge_into(team, draft.read_text(encoding="utf-8"), out):
@@ -345,7 +353,8 @@ def publish(audio: Path, out: Path) -> str:
     else:
         shutil.copy2(draft, audio.parent / f"{name} draft.md")
         line = f"Meeting notes drafted: {name}"
-    shutil.copy2(TRANSCRIPTS / f"{stem}.txt", audio.parent / f"{name} transcript.md")
+    said.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(TRANSCRIPTS / f"{stem}.txt", said / f"{name} transcript.md")
     tmp = out / "summary.md.tmp"
     shutil.copy2(draft, tmp)
     tmp.replace(out / "summary.md")
@@ -534,7 +543,9 @@ def selftest() -> None:
         answers.append(answer)
     (tmp / "report.txt").write_text("")
     calls.clear()
+    os.environ["MEETINGS_TRANSCRIPTS"] = str(tmp / "mine")
     assert main() == 1  # bad.wav still failing
+    os.environ.pop("MEETINGS_TRANSCRIPTS")
     assert team.read_text() == (
         "---\nparticipants: A, B\n---\n# Team\n- said by hand\n![[board.jpg]]\n\n"
         "- from the recording\n- what the board shows\n"
@@ -553,7 +564,8 @@ def selftest() -> None:
     # An empty answer is refused: the note stands and the draft lands beside it.
     assert (inbox / "10-21-26 10h30 2 draft.md").read_text() == "draft"
     assert not (inbox / "10-21-26 10h30 draft.md").exists()  # the merged one wrote no draft
-    assert (inbox / "10-21-26 10h30 transcript.md").exists()
+    assert (tmp / "mine" / "10-21-26 10h30 transcript.md").exists()  # MEETINGS_TRANSCRIPTS
+    assert not (inbox / "10-21-26 10h30 transcript.md").exists()
     assert (tmp / "report.txt").read_text() == (
         "Meeting notes merged into 10-21-26\nMeeting notes drafted: 10-21-26 10h30 2\n"
     ), (tmp / "report.txt").read_text()
