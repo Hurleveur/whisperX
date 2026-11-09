@@ -9,10 +9,10 @@ usage() {
     cat >&2 <<EOF
 usage: meeting.sh [options] <audio-file> [extra whisperx args...]
 
-Audio file -> transcript -> meeting notes from an LLM. The transcript is
-written by the home Tiiny's Qwen3-ASR through the HAI OS owner door, with no
-speaker labels and nothing heavy on this machine; ASR=whisperx runs diarized
-whisperX here instead. Writes transcripts/<name>.json and .txt (whisperX also
+Audio file -> transcript -> meeting notes from an LLM. On a machine with an
+NVIDIA GPU the transcript is diarized whisperX on that GPU; elsewhere the home
+Tiiny's Qwen3-ASR writes it through the HAI OS owner door, with no speaker
+labels and nothing heavy on this machine's CPU. Writes transcripts/<name>.json and .txt (whisperX also
 .srt, .tsv, .vtt) and
 transcripts/<name>-notes/{part-NN.md,summary.md}.
 
@@ -30,8 +30,9 @@ Options (must come before the audio file):
   -h, --help       this message.
 
 Environment:
-  ASR              tiiny (default: scripts/tiiny_transcribe.py, door URL in
-                   ~/.config/hai/door) or whisperx (on this machine)
+  ASR              whisperx (default where nvidia-smi sees a GPU) or tiiny
+                   (default elsewhere: scripts/tiiny_transcribe.py, door URL in
+                   ~/.config/hai/door)
   WHISPER_MODEL    whisper model (default: large-v2)
   BATCH_SIZE       whisperX batch size (default: 4; lower it if VRAM is tight)
   WHISPER_HOTWORDS_FILE  words whisper should expect, such as product and
@@ -81,9 +82,13 @@ out=$repo/transcripts
 name=$(basename "$audio")
 json="$out/${name%.*}.json"
 
+# whisperX on a CPU took 19 minutes for 150 s unfinished (2026-11-09): without a GPU the Tiiny hears.
+if [ -z "${ASR:-}" ]; then
+    if nvidia-smi -L >/dev/null 2>&1; then ASR=whisperx; else ASR=tiiny; fi
+fi
 if [ -f "$json" ]; then
     echo "transcript already there, skipping transcription: $json" >&2
-elif [ "${ASR:-tiiny}" = tiiny ]; then
+elif [ "$ASR" = tiiny ]; then
     "$repo/.venv/bin/python" "$repo/scripts/tiiny_transcribe.py" "$audio" "$out" >/dev/null
 else
     # On x86_64 the pinned torch is the CUDA build whether or not the machine has a

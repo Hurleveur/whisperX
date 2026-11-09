@@ -2,10 +2,11 @@
 
 Drop an audio file in a meetings folder you chose. The box that watches it transcribes
 it, drafts the notes beside it, and moves the audio out to an archive;
-`scripts/meeting_inbox.py` does this when the hai-os job runner calls it. Both the
-transcription and the draft run on the owner's inference box (the home Tiiny), reached
-through the HAI OS owner door, so the machine that runs the job does no heavy work. The
-transcript has no speaker labels for now: the box has no diarization yet.
+`scripts/meeting_inbox.py` does this when the hai-os job runner calls it. On a machine
+with an NVIDIA GPU (the home laptop) the transcription is diarized whisperX on that GPU,
+with speaker labels; on a machine without one it is the owner's inference box (the home
+Tiiny), with no speaker labels, so a CPU never transcribes. The draft runs on the Tiiny's
+chat model either way, reached through the HAI OS owner door.
 
 1. **Choose the folder, on one box.** Set `MEETINGS_INBOX` to the folder's path in the
    job's environment. Under hai-os that is this machine's `background/jobs.local.toml`
@@ -26,9 +27,9 @@ transcript has no speaker labels for now: the box has no diarization yet.
    its modification time when the job picks it up, `Recording 2026-10-21 10_30.m4a`, so
    each recording gets its own transcript and archive folder. A name already taken in
    the folder or the archive gets a number.
-3. **Wait.** The job runs only while the machine is idle and on mains power. The Tiiny
-   transcribes at about half real time (a 4-minute recording took 2 minutes, 2026-11-09),
-   then drafts. It serves one request at a time, so the job waits while you are at the
+3. **Wait.** The job runs only while the machine is idle and on mains power. The home
+   laptop's GPU transcribed a 2.4-hour recording within 26 minutes; the Tiiny transcribes
+   at about half real time (a 4-minute recording took 2 minutes, 2026-11-09). Then it drafts. It serves one request at a time, so the job waits while you are at the
    machine, where you may be using the box yourself. If the box is off or locked the run
    fails and the next run resumes from the clip it reached.
 4. **Find the result.** `<M-DD-YY> <HH>h<MM> draft.md` and `... transcript.md` appear in
@@ -59,8 +60,8 @@ transcript has no speaker labels for now: the box has no diarization yet.
    the draft's own quotes: read them as a draft. The merge uses the same model and cloud
    purpose as the draft, so with a cloud purpose set the team's note leaves the box for
    that call too. The merged notes are kept shorter than the draft, and the draft's `Said agreements` section stays in the archived `summary.md` rather than the note.
-Steps 5 and 6 apply only to a transcript made with `ASR=whisperx` (diarized whisperX on the
-machine itself, set in the job's environment); the Tiiny's transcript has no speakers to name.
+Steps 5 and 6 apply only to a whisperX transcript (a machine with a GPU, or `ASR=whisperx`
+in the job's environment); the Tiiny's transcript has no speakers to name.
 
 5. **Name the speakers and redo the draft.** Voices enrolled earlier are named
    automatically (step 6). For anyone else, read the `.txt`, note which `SPEAKER_NN`
@@ -117,7 +118,8 @@ not checked at all: read the draft as a rough index of the transcript, not as th
   overrides the path) on its `meeting` cloud purpose (Gemma 4 31B on a zero-data-retention
   OpenRouter endpoint, about $0.02 for an hour of meeting), or with `LLM_ESCALATE=`
   (empty) on its local model `hai-local`.
-- For `ASR=whisperx` only: the `large-v3-turbo` weights (downloaded on first use) and a
+- For whisperX (a machine with an NVIDIA GPU, or `ASR=whisperx`; `ASR=tiiny` forces the
+  Tiiny): the `large-v3-turbo` weights (downloaded on first use) and a
   Hugging Face token the pyannote diarization models accept, as `HF_TOKEN` in the job's
   environment or in the `huggingface_hub` login cache, with the gated model terms accepted.
 - When the job finishes a recording it leaves a quiet row in the cockpit's Activity
