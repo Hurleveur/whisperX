@@ -128,7 +128,8 @@ def heard_as(text: str) -> str:
 def caption(clips: queue.Queue, language: str, translate, fallback) -> None:
     """The Tiiny writes each clip down; the row prints once its text is translated here.
     The Tiiny ignores `language` and sometimes hears Flemish as German, Arabic or Persian: such a
-    clip is heard again here by Whisper with Dutch forced, slower but rare."""
+    clip is heard again here by Whisper large-v3-turbo with Dutch forced (about real time on
+    this CPU; small left half the room clips empty, 2026-11-09), slower but rare."""
     while True:
         pcm = clips.get()
         try:
@@ -220,7 +221,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--selftest", action="store_true")
     p.add_argument("--language", default="nl", help="spoken language hint for the Tiiny (it ignores it today)")
-    p.add_argument("--whisper", default="small", help="local model re-hearing a clip the box got wrong")
+    p.add_argument("--whisper", default="large-v3-turbo", help="local model re-hearing a clip the box got wrong")
     p.add_argument("--door", help=f"HAI OS owner door URL (default: the line in {DOOR_FILE})")
     p.add_argument("--model", default="Helsinki-NLP/opus-mt-nl-en", help="translation model on this laptop")
     args = p.parse_args()
