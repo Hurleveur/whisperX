@@ -11,7 +11,8 @@ Tiiny's chat model for a summary, next steps, agreements and lessons, and PUTs
     python scripts/pod_meetings.py [--once] [--interval 120]
     python scripts/pod_meetings.py --selftest
 
-Needs `~/.config/hai/pod-meetings.json` (keys id, secret, webid, pod, issuer) and the door
+Needs `~/.config/hai/pod-meetings.json` (keys id, secret, pod, issuer; or pod plus `from`, the
+Obsidian Solid sync plugin's data.json, whose client credential is then used) and the door
 file `~/.config/hai/door`. The secret and the access token are never printed or logged.
 Standard library only: the DPoP proofs are signed with the small P-256 code below, because
 the venv carries no crypto package.
@@ -41,7 +42,7 @@ from analyze_meeting import chunk, read_transcript  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 CREDS_FILE = Path.home() / ".config/hai/pod-meetings.json"
-CREDS_KEYS = ("id", "secret", "webid", "pod")
+CREDS_KEYS = ("id", "secret", "pod")
 INBOX = "meetings/inbox/"
 LANGUAGES = {"nl": "Dutch", "en": "English", "fr": "French"}
 CHUNK_CHARS = 12000  # a transcript piece per request; the Tiiny's context is the limit
@@ -161,6 +162,16 @@ def load_creds(path: Path) -> dict:
                          f"{', '.join(CREDS_KEYS)} and issuer (see docs/meeting-inbox.md)")
     except ValueError:
         raise SystemExit(f"{path} is not valid JSON; it needs the keys {', '.join(CREDS_KEYS)}")
+    # `from`: a client credential already on this machine, the Obsidian Solid sync plugin's,
+    # read here by key so it is never copied into a second file.
+    if raw.get("from"):
+        src = Path(raw["from"]).expanduser()
+        try:
+            plugin = json.loads(src.read_text())
+        except (OSError, ValueError) as e:
+            raise SystemExit(f"{path}: cannot read the credential file it names, {src} ({type(e).__name__})")
+        for key, theirs in (("id", "clientId"), ("secret", "clientSecret"), ("issuer", "issuer")):
+            raw[key] = raw.get(key) or plugin.get(theirs)
     missing = [k for k in CREDS_KEYS if not isinstance(raw.get(k), str) or not raw[k]]
     if missing:
         raise SystemExit(f"{path} lacks the keys: {', '.join(missing)}")
@@ -490,7 +501,8 @@ def selftest() -> None:
     # Credentials file: a clear exit, never a traceback, never the secret.
     tmp = Path(tempfile.mkdtemp())
     for content, needle in [(None, str(tmp / "c.json")), ("{", "not valid JSON"),
-                            ('{"id": "i", "secret": "SECRETVALUE"}', "webid, pod")]:
+                            ('{"id": "i", "secret": "SECRETVALUE"}', "lacks the keys: pod"),
+                            ('{"from": "%s", "pod": "https://x/y/"}' % (tmp / "nope.json"), "cannot read")]:
         if content is not None:
             (tmp / "c.json").write_text(content)
         try:
@@ -500,6 +512,10 @@ def selftest() -> None:
             assert needle in str(e) and "SECRETVALUE" not in str(e), e
     (tmp / "c.json").write_text('{"id":"i","secret":"s","webid":"w","pod":"https://x/y/"}')
     assert load_creds(tmp / "c.json")["issuer"] == "https://x/"
+    (tmp / "p.json").write_text('{"clientId":"pi","clientSecret":"ps","issuer":"https://idp.example"}')
+    (tmp / "c.json").write_text(json.dumps({"from": str(tmp / "p.json"), "pod": "https://x/y/"}))
+    got = load_creds(tmp / "c.json")
+    assert (got["id"], got["secret"], got["issuer"]) == ("pi", "ps", "https://idp.example/"), got
     shutil.rmtree(tmp)
     print("ok")
 
