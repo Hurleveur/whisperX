@@ -37,6 +37,8 @@ Environment:
                    the recording is English, --language en or heard so in its
                    first minutes, else large-v3; without a GPU large-v3-turbo)
   BATCH_SIZE       whisperX batch size (default: 4; lower it if VRAM is tight)
+  WHISPER_COMPUTE  float16 or int8 (default on a GPU: float16 with 5 GB free,
+                   else int8, which fits beside a model already on the card)
   WHISPER_HOTWORDS_FILE  words whisper should expect, such as product and
                    people names, comma-separated (default:
                    ~/.local/share/whisperx/hotwords.txt; skipped when absent)
@@ -101,7 +103,11 @@ else
         # "Unable to load any of {libcudnn_cnn.so.9...}" mid-run.
         nv=$(echo "$repo"/.venv/lib/python*/site-packages/nvidia)
         export LD_LIBRARY_PATH="$nv/cudnn/lib:$nv/cublas/lib:$nv/cuda_runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-        compute=float16
+        # large-v3 in float16 ran out of memory on a 6 GB card beside a llama-server
+        # holding 3.5 GB; int8 fits there and finishes. float16 only with room for it.
+        free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1)
+        if [ "${free:-0}" -ge 5000 ]; then compute=float16; else compute=int8; fi
+        compute=${WHISPER_COMPUTE:-$compute}
         if [ "${WHISPER_MODEL:-auto}" = auto ]; then
             WHISPER_MODEL=$("$repo/.venv/bin/python" "$repo/scripts/pick_whisper.py" "$audio" "$@")
         fi
