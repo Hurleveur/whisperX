@@ -1,0 +1,20 @@
+# The pod worker as a systemd user service: polls the pod's meetings/inbox/ every
+# 120 s and survives logouts (with linger) and reboots. Install and run:
+#   cp scripts/pod-meetings.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now pod-meetings
+#   journalctl --user -u pod-meetings -f
+# Assumes the repo at ~/Documents/GitHub/whisperX; edit the three paths if it lives elsewhere.
+[Unit]
+Description=Meeting recordings from the Solid pod: transcribe and draft (whisperX pod_meetings.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=%h/Documents/GitHub/whisperX
+ExecStart=%h/Documents/GitHub/whisperX/.venv/bin/python %h/Documents/GitHub/whisperX/scripts/pod_meetings.py
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=default.target

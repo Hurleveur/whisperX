@@ -142,3 +142,13 @@ The meetings applet in the browser uploads a recording to the owner's Solid pod,
 - Credentials: the owner mints a client-credentials token on the pod's account page (`<pod server>/.account/`, "Client credentials", pick the WebID, give it a name) and writes `~/.config/hai/pod-meetings.json` with the keys `id`, `secret`, `webid`, `pod` (the pod root URL, ending in `/`) and `issuer` (optional, default the pod URL's origin, which is the issuer on a Community Solid Server). The secret is shown once. It is read from that file inside the process and never printed, logged or put in the environment. Also needed: the door URL in `~/.config/hai/door`, as above.
 - Run: `.venv/bin/python scripts/pod_meetings.py` polls every 120 s (`--interval`); `--once` does one pass and exits 1 when a folder failed. `--selftest` runs offline.
 - Needs only the standard library: the DPoP proofs are signed by a small P-256 implementation in the script.
+
+### Running it on its own
+
+`scripts/pod-meetings.service` is a systemd user unit that keeps the worker running, so a recording uploaded from the browser gets transcribed without anyone starting anything. It assumes the repo at `~/Documents/GitHub/whisperX`; edit its paths if it lives elsewhere.
+
+1. Install it: `cp scripts/pod-meetings.service ~/.config/systemd/user/`, then `systemctl --user daemon-reload` and `systemctl --user enable --now pod-meetings`.
+2. Watch it: `journalctl --user -u pod-meetings -f`. A missing credentials or door file stops the worker with its reason in that log, and systemd tries again after 60 s.
+3. Keep it running while nobody is logged in: `loginctl enable-linger $USER` (once; some systems ask for an admin password). Without it the service stops at logout and starts again at the next login.
+
+The service does not see a login shell's environment: the diarization's Hugging Face token has to be in the `huggingface_hub` login cache (`huggingface-cli login`), not only in a shell's `HF_TOKEN`.
