@@ -6,7 +6,8 @@ Run on the home laptop (see docs/meeting-inbox.md). The browser applet PUTs
 folder without a `done`, this downloads the recording, runs `meeting.sh --transcribe-only`
 (GPU whisperX, or the Tiiny's ASR through the owner door: never whisper on a CPU), asks the
 Tiiny's chat model for a summary, next steps, agreements and lessons, and PUTs
-`transcript.txt`, `draft.json` and last an empty `done`. A failed folder is retried next run.
+`transcript.txt`, `draft.json` and last an empty `done`. A failed folder is retried next run,
+except a recording with no speech, which gets a `failed` file and is left alone.
 
     python scripts/pod_meetings.py [--once] [--interval 120]
     python scripts/pod_meetings.py --selftest
@@ -272,6 +273,8 @@ def decide(meta: dict | None, names: set[str]) -> str:
     """'process' only for a folder with meta.json and its audio and no done."""
     if "done" in names:
         return "skip: done"
+    if "failed" in names:
+        return "skip: failed"
     if meta is None or "meta.json" not in names:
         return "skip: no meta.json"
     audio = meta.get("audio")
@@ -377,7 +380,10 @@ def process_folder(pod: Pod, folder: str, door: str, model: str) -> str:
             shutil.copyfileobj(r, f)
         transcript = transcribe(audio, language)
     if not transcript.strip():
-        raise RuntimeError("the transcript is empty")
+        # meeting.sh caches the empty result under the audio stem, so a retry can never do
+        # better: mark the folder for good instead of downloading it again every pass.
+        pod.put(folder + "failed", b"no speech in the recording\n", "text/plain")
+        return "failed: no speech in the recording"
     draft = draft_notes(transcript, language, door, model)
     write_results(pod.put, folder, transcript, draft)
     return "done"
@@ -490,6 +496,7 @@ def selftest() -> None:
     assert decide(None, {"rec.webm"}).startswith("skip") and decide(meta, {"rec.webm"}).startswith("skip")
     assert decide(meta, {"meta.json"}).startswith("skip"), "audio still uploading"
     assert decide({"audio": 5}, {"meta.json"}).startswith("skip")
+    assert decide(meta, {"meta.json", "rec.webm", "failed"}) == "skip: failed"
 
     # Write order: done last, with the content types the applet reads.
     puts = []
