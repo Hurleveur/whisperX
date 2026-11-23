@@ -341,6 +341,9 @@ def asr_name() -> str:
 
 
 MIN_SHARE = 0.05  # a label with fewer of the lines is a stray split of diarization, not a person
+# A participant's enrolled voice through a phone scored 0.48-0.59 in five meetings (2026-11-23,
+# laptop-enrolled), every other voice 0.30 at most: closest by this much is that person.
+NEAR, MARGIN = 0.45, 0.2
 
 
 def same_person(a: str, b: str) -> bool:
@@ -358,15 +361,25 @@ def speaker_names(emb: dict, known: dict, floor: float, participants: list,
     (voices.match); then, when exactly one label of any weight (MIN_SHARE of the lines) and
     exactly one of the meeting's participants are left, that label is that person, and is
     returned as learned so its voice can be enrolled. Any other leftover keeps its SPEAKER_NN:
-    a wrong name in the notes, or in the voices, is worse than none."""
+    a wrong name in the notes, or in the voices, is worse than none.
+    Between the two, a participant whose voice is enrolled but heard through another
+    microphone (under `floor`) is the one real label clearly closest to it (NEAR, MARGIN
+    ahead of the next), and is learned too, so that microphone's voice is known next time."""
     named = voices.match(emb, known, floor)
-    taken = {n.casefold() for n in named.values()}
-    people = {p.strip().casefold(): p.strip() for p in reversed(participants) if isinstance(p, str) and p.strip()}
-    left_people = [p for k, p in people.items() if not any(same_person(k, t) for t in taken)]
     total = sum((lines or {}).values())
-    left_labels = [lab for lab in emb if lab not in named
-                   and (not total or (lines or {}).get(lab, 0) / total >= MIN_SHARE)]
+    real = [lab for lab in emb if not total or (lines or {}).get(lab, 0) / total >= MIN_SHARE]
+    people = {p.strip().casefold(): p.strip() for p in reversed(participants) if isinstance(p, str) and p.strip()}
     learned = {}
+    for k in people:
+        for name, samples in known.items():
+            if not samples or name in named.values() or not same_person(k, name.casefold()):
+                continue
+            near = sorted(((max(voices.cosine(emb[lab], s) for s in samples), lab) for lab in real if lab not in named), reverse=True)
+            if near and near[0][0] >= NEAR and (len(near) == 1 or near[0][0] - near[1][0] >= MARGIN):
+                named[near[0][1]] = learned[near[0][1]] = name
+    taken = {n.casefold() for n in named.values()}
+    left_people = [p for k, p in people.items() if not any(same_person(k, t) for t in taken)]
+    left_labels = [lab for lab in real if lab not in named]
     if len(left_labels) == 1 and len(left_people) == 1:
         learned[left_labels[0]] = left_people[0]
     return {**named, **learned}, learned
@@ -597,6 +610,16 @@ def selftest() -> None:
     assert sn({"S0": me, "S1": other}, {"Alexandre": [me]}, 0.7, ["Alex", "Neil"]) == ({"S0": "Alexandre", "S1": "Neil"}, {"S1": "Neil"})
     assert sn({"S0": me, "S1": other}, {"Alex": [me]}, 0.7, ["Alexandre De Groodt", "Neil"])[1] == {"S1": "Neil"}
     assert not same_person("al", "alexandre") and not same_person("neil", "nicolas")
+    # Another microphone: the participant's voice at 0.55, under the floor, the other at 0. It is
+    # still that participant (learned, for that microphone), and Neil follows by elimination.
+    me3, phone3, other3, half3 = [1.0, 0.0, 0.0], [0.55, 0.835, 0.0], [0.0, 0.0, 1.0], [0.4, 0.0, 0.917]
+    assert sn({"S0": phone3, "S1": other3}, {"Alexandre": [me3]}, 0.7, ["Alex", "Neil"]) == (
+        {"S0": "Alexandre", "S1": "Neil"}, {"S0": "Alexandre", "S1": "Neil"})
+    # Not clearly the closest (0.55 against 0.40), or not near at all: no name, nothing learned.
+    assert sn({"S0": phone3, "S1": half3}, {"Alexandre": [me3]}, 0.7, ["Alex", "Neil"]) == ({}, {})
+    assert sn({"S0": other3, "S1": [0.3, 0.0, 0.954]}, {"Alexandre": [me3]}, 0.7, ["Alex", "Neil"]) == ({}, {})
+    # Not a participant of this meeting: an enrolled voice is never placed by closeness.
+    assert sn({"S0": phone3, "S1": other3}, {"Alexandre": [me3]}, 0.7, ["Neil", "Ann"]) == ({}, {})
     # Everyone already known: nothing learned twice.
     assert sn({"S0": me, "S1": other}, {"Alex": [me], "Neil": [other]}, 0.7, ["Alex", "Neil"])[1] == {}
     print("ok")
