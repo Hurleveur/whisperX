@@ -39,6 +39,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import live_translate  # noqa: E402  (post() and the one-request-at-a-time BOX lock)
 import meeting_inbox  # noqa: E402  (DOOR_FILE, running_box_model)
+import voices  # noqa: E402  (enrolled voices name the diarization labels)
 from analyze_meeting import chunk, read_transcript  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
@@ -339,7 +340,21 @@ def asr_name() -> str:
     return asr
 
 
-def transcribe(audio: Path, language: str) -> str:
+def speaker_names(emb: dict, known: dict, floor: float, participants: list) -> dict[str, str]:
+    """{label: name}: the voices enrolled on this box first (voices.match), then, when exactly
+    one label and exactly one of the meeting's participants are left, that label is that person.
+    Any other leftover keeps its SPEAKER_NN: a wrong name in the notes is worse than none."""
+    named = voices.match(emb, known, floor)
+    taken = {n.casefold() for n in named.values()}
+    left_people = [p for p in dict.fromkeys(participants) if isinstance(p, str) and p.strip()
+                   and p.strip().casefold() not in taken]
+    left_labels = [lab for lab in emb if lab not in named]
+    if len(left_labels) == 1 and len(left_people) == 1:
+        named[left_labels[0]] = left_people[0].strip()
+    return named
+
+
+def transcribe(audio: Path, language: str, participants: list | None = None) -> str:
     sh = os.environ.get("MEETING_SH") or str(REPO / "scripts/meeting.sh")  # the override is for tests
     asr = asr_name()
     cmd = [sh, "--transcribe-only", str(audio)]
@@ -351,7 +366,14 @@ def transcribe(audio: Path, language: str) -> str:
     lines = run.stdout.strip().splitlines()
     if not lines:
         raise RuntimeError("meeting.sh printed no transcript path")
-    return read_transcript(Path(lines[-1]))
+    path = Path(lines[-1])
+    # --transcribe-only stops before meeting.sh names the voices, so the names are put here.
+    names = {}
+    if path.suffix == ".json":
+        names = speaker_names(voices.embeddings(path), voices.load(voices.voices_dir()),
+                              voices.threshold(), participants or [])  # fmt: skip
+        log(f"speakers named: {', '.join(f'{k}={v}' for k, v in sorted(names.items())) or 'none'}")
+    return read_transcript(path, names)
 
 
 def write_results(put, folder: str, transcript: str, draft: dict) -> None:
@@ -378,7 +400,8 @@ def process_folder(pod: Pod, folder: str, door: str, model: str) -> str:
         audio = Path(tmp) / audio_name
         with pod.request("GET", folder + urllib.parse.quote(meta["audio"])) as r, audio.open("wb") as f:
             shutil.copyfileobj(r, f)
-        transcript = transcribe(audio, language)
+        people = meta.get("participants") if isinstance(meta.get("participants"), list) else []
+        transcript = transcribe(audio, language, people)
     if not transcript.strip():
         # meeting.sh caches the empty result under the audio stem, so a retry can never do
         # better: mark the folder for good instead of downloading it again every pass.
@@ -524,6 +547,18 @@ def selftest() -> None:
     got = load_creds(tmp / "c.json")
     assert (got["id"], got["secret"], got["issuer"]) == ("pi", "ps", "https://idp.example/"), got
     shutil.rmtree(tmp)
+
+    # Speakers: an enrolled voice names its label; one label and one participant left pair up.
+    me, other = [1.0, 0.0], [0.0, 1.0]
+    known = {"Alex": [me]}
+    assert speaker_names({"S0": me, "S1": other}, known, 0.7, ["Alex", "Neil"]) == {"S0": "Alex", "S1": "Neil"}
+    assert speaker_names({"S0": me, "S1": other}, known, 0.7, ["alex ", "Neil", "Neil"]) == {"S0": "Alex", "S1": "Neil"}
+    # Two labels or two people left: no guess.
+    assert speaker_names({"S0": me, "S1": other, "S2": [0.6, 0.8]}, known, 0.7, ["Alex", "Neil"]) == {"S0": "Alex"}
+    assert speaker_names({"S0": me, "S1": other}, known, 0.7, ["Alex", "Neil", "Ann"]) == {"S0": "Alex"}
+    # Nobody enrolled: a one-to-one meeting is still not guessed, two labels are left.
+    assert speaker_names({"S0": me, "S1": other}, {}, 0.7, ["Alex", "Neil"]) == {}
+    assert speaker_names({"S0": me}, {}, 0.7, ["Alex"]) == {"S0": "Alex"}
     print("ok")
 
 
