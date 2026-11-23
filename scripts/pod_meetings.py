@@ -340,18 +340,27 @@ def asr_name() -> str:
     return asr
 
 
-def speaker_names(emb: dict, known: dict, floor: float, participants: list) -> dict[str, str]:
-    """{label: name}: the voices enrolled on this box first (voices.match), then, when exactly
-    one label and exactly one of the meeting's participants are left, that label is that person.
-    Any other leftover keeps its SPEAKER_NN: a wrong name in the notes is worse than none."""
+MIN_SHARE = 0.05  # a label with fewer of the lines is a stray split of diarization, not a person
+
+
+def speaker_names(emb: dict, known: dict, floor: float, participants: list,
+                  lines: dict | None = None) -> tuple[dict[str, str], dict[str, str]]:
+    """({label: name}, {label: name} learned). The voices enrolled on this box first
+    (voices.match); then, when exactly one label of any weight (MIN_SHARE of the lines) and
+    exactly one of the meeting's participants are left, that label is that person, and is
+    returned as learned so its voice can be enrolled. Any other leftover keeps its SPEAKER_NN:
+    a wrong name in the notes, or in the voices, is worse than none."""
     named = voices.match(emb, known, floor)
     taken = {n.casefold() for n in named.values()}
-    left_people = [p for p in dict.fromkeys(participants) if isinstance(p, str) and p.strip()
-                   and p.strip().casefold() not in taken]
-    left_labels = [lab for lab in emb if lab not in named]
+    people = {p.strip().casefold(): p.strip() for p in reversed(participants) if isinstance(p, str) and p.strip()}
+    left_people = [p for k, p in people.items() if k not in taken]
+    total = sum((lines or {}).values())
+    left_labels = [lab for lab in emb if lab not in named
+                   and (not total or (lines or {}).get(lab, 0) / total >= MIN_SHARE)]
+    learned = {}
     if len(left_labels) == 1 and len(left_people) == 1:
-        named[left_labels[0]] = left_people[0].strip()
-    return named
+        learned[left_labels[0]] = left_people[0]
+    return {**named, **learned}, learned
 
 
 def transcribe(audio: Path, language: str, participants: list | None = None) -> str:
@@ -370,9 +379,22 @@ def transcribe(audio: Path, language: str, participants: list | None = None) -> 
     # --transcribe-only stops before meeting.sh names the voices, so the names are put here.
     names = {}
     if path.suffix == ".json":
-        names = speaker_names(voices.embeddings(path), voices.load(voices.voices_dir()),
-                              voices.threshold(), participants or [])  # fmt: skip
+        store = voices.voices_dir()
+        segments = json.loads(path.read_text()).get("segments") or []
+        lines = {}
+        for seg in segments:
+            if seg.get("speaker"):
+                lines[seg["speaker"]] = lines.get(seg["speaker"], 0) + 1
+        names, learned = speaker_names(voices.embeddings(path), voices.load(store),
+                                       voices.threshold(), participants or [], lines)  # fmt: skip
         log(f"speakers named: {', '.join(f'{k}={v}' for k, v in sorted(names.items())) or 'none'}")
+        # Told by the participant list rather than heard: kept, so the next meeting knows the voice.
+        for label, name in learned.items():
+            try:
+                n = voices.enroll(path, label, name, store)
+                log(f"voice learned: {name} ({n} sample(s))")
+            except SystemExit as e:  # an unusable name or no embedding: the transcript still goes out
+                log(f"voice not learned for {name}: {e}")
     return read_transcript(path, names)
 
 
@@ -548,17 +570,22 @@ def selftest() -> None:
     assert (got["id"], got["secret"], got["issuer"]) == ("pi", "ps", "https://idp.example/"), got
     shutil.rmtree(tmp)
 
-    # Speakers: an enrolled voice names its label; one label and one participant left pair up.
-    me, other = [1.0, 0.0], [0.0, 1.0]
+    # Speakers: an enrolled voice names its label; one label and one participant left pair up,
+    # and that pairing is what gets learned. A stray label (under MIN_SHARE of the lines) does not count.
+    me, other, third = [1.0, 0.0], [0.0, 1.0], [0.6, 0.8]
     known = {"Alex": [me]}
-    assert speaker_names({"S0": me, "S1": other}, known, 0.7, ["Alex", "Neil"]) == {"S0": "Alex", "S1": "Neil"}
-    assert speaker_names({"S0": me, "S1": other}, known, 0.7, ["alex ", "Neil", "Neil"]) == {"S0": "Alex", "S1": "Neil"}
-    # Two labels or two people left: no guess.
-    assert speaker_names({"S0": me, "S1": other, "S2": [0.6, 0.8]}, known, 0.7, ["Alex", "Neil"]) == {"S0": "Alex"}
-    assert speaker_names({"S0": me, "S1": other}, known, 0.7, ["Alex", "Neil", "Ann"]) == {"S0": "Alex"}
-    # Nobody enrolled: a one-to-one meeting is still not guessed, two labels are left.
-    assert speaker_names({"S0": me, "S1": other}, {}, 0.7, ["Alex", "Neil"]) == {}
-    assert speaker_names({"S0": me}, {}, 0.7, ["Alex"]) == {"S0": "Alex"}
+    sn = speaker_names
+    assert sn({"S0": me, "S1": other}, known, 0.7, ["Alex", "Neil"]) == ({"S0": "Alex", "S1": "Neil"}, {"S1": "Neil"})
+    assert sn({"S0": me, "S1": other}, known, 0.7, ["alex ", " Neil", "Neil"])[0] == {"S0": "Alex", "S1": "Neil"}
+    assert sn({"S0": other, "S1": me, "S2": third}, known, 0.7, ["Alex", "Neil"],
+              {"S0": 3, "S1": 127, "S2": 102}) == ({"S1": "Alex", "S2": "Neil"}, {"S2": "Neil"})
+    # Two real labels or two people left: no guess, nothing learned.
+    assert sn({"S0": me, "S1": other, "S2": third}, known, 0.7, ["Alex", "Neil"]) == ({"S0": "Alex"}, {})
+    assert sn({"S0": me, "S1": other}, known, 0.7, ["Alex", "Neil", "Ann"]) == ({"S0": "Alex"}, {})
+    assert sn({"S0": me, "S1": other}, {}, 0.7, ["Alex", "Neil"]) == ({}, {})
+    assert sn({"S0": me}, {}, 0.7, ["Alex"]) == ({"S0": "Alex"}, {"S0": "Alex"})
+    # Everyone already known: nothing learned twice.
+    assert sn({"S0": me, "S1": other}, {"Alex": [me], "Neil": [other]}, 0.7, ["Alex", "Neil"])[1] == {}
     print("ok")
 
 
