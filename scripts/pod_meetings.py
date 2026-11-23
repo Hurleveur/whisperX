@@ -343,6 +343,15 @@ def asr_name() -> str:
 MIN_SHARE = 0.05  # a label with fewer of the lines is a stray split of diarization, not a person
 
 
+def same_person(a: str, b: str) -> bool:
+    """Two case-folded names one person goes by: equal, one the short form of the other
+    ("alex", "alexandre"), or the same first name ("alexandre de groodt", "alexandre")."""
+    a, b = a.split(), b.split()
+    if not a or not b:
+        return False
+    return a[0] == b[0] or (len(a[0]) >= 3 and len(b[0]) >= 3 and (a[0].startswith(b[0]) or b[0].startswith(a[0])))
+
+
 def speaker_names(emb: dict, known: dict, floor: float, participants: list,
                   lines: dict | None = None) -> tuple[dict[str, str], dict[str, str]]:
     """({label: name}, {label: name} learned). The voices enrolled on this box first
@@ -353,7 +362,7 @@ def speaker_names(emb: dict, known: dict, floor: float, participants: list,
     named = voices.match(emb, known, floor)
     taken = {n.casefold() for n in named.values()}
     people = {p.strip().casefold(): p.strip() for p in reversed(participants) if isinstance(p, str) and p.strip()}
-    left_people = [p for k, p in people.items() if k not in taken]
+    left_people = [p for k, p in people.items() if not any(same_person(k, t) for t in taken)]
     total = sum((lines or {}).values())
     left_labels = [lab for lab in emb if lab not in named
                    and (not total or (lines or {}).get(lab, 0) / total >= MIN_SHARE)]
@@ -584,6 +593,10 @@ def selftest() -> None:
     assert sn({"S0": me, "S1": other}, known, 0.7, ["Alex", "Neil", "Ann"]) == ({"S0": "Alex"}, {})
     assert sn({"S0": me, "S1": other}, {}, 0.7, ["Alex", "Neil"]) == ({}, {})
     assert sn({"S0": me}, {}, 0.7, ["Alex"]) == ({"S0": "Alex"}, {"S0": "Alex"})
+    # A participant written short or long is the enrolled voice: "Alex" is "Alexandre", so Neil is left.
+    assert sn({"S0": me, "S1": other}, {"Alexandre": [me]}, 0.7, ["Alex", "Neil"]) == ({"S0": "Alexandre", "S1": "Neil"}, {"S1": "Neil"})
+    assert sn({"S0": me, "S1": other}, {"Alex": [me]}, 0.7, ["Alexandre De Groodt", "Neil"])[1] == {"S1": "Neil"}
+    assert not same_person("al", "alexandre") and not same_person("neil", "nicolas")
     # Everyone already known: nothing learned twice.
     assert sn({"S0": me, "S1": other}, {"Alex": [me], "Neil": [other]}, 0.7, ["Alex", "Neil"])[1] == {}
     print("ok")
