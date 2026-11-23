@@ -318,16 +318,28 @@ def ask(door: str, model: str, system: str, user: str) -> dict:
     return coerce_draft(extract_json(answer["choices"][0]["message"]["content"]))
 
 
+TRIES = 3  # the box model's JSON is sometimes broken; one bad piece must not throw the others away
+
+
 def draft_notes(transcript: str, language: str, door: str, model: str, ask_fn=ask) -> dict:
     lang = LANGUAGES.get(language, "the language the meeting was held in")
     system = DRAFT_PROMPT.format(language=lang)
-    parts = [ask_fn(door, model, system, c) for c in chunk(transcript, CHUNK_CHARS)]
+
+    def asked(system: str, user: str) -> dict:
+        for left in range(TRIES - 1, -1, -1):
+            try:
+                return ask_fn(door, model, system, user)
+            except ValueError:  # json.JSONDecodeError included: asked again, the same piece alone
+                if not left:
+                    raise
+
+    parts = [asked(system, c) for c in chunk(transcript, CHUNK_CHARS)]
     if len(parts) == 1:
         return parts[0]
     if not parts:
         return coerce_draft({})
-    return ask_fn(door, model, COMBINE_PROMPT.format(language=lang),
-                  "\n\n".join(json.dumps(p, ensure_ascii=False) for p in parts))
+    return asked(COMBINE_PROMPT.format(language=lang),
+                 "\n\n".join(json.dumps(p, ensure_ascii=False) for p in parts))
 
 
 def asr_name() -> str:
@@ -554,6 +566,23 @@ def selftest() -> None:
     calls.clear()
     draft_notes("short", "nl", "d", "m", fake)
     assert len(calls) == 1 and "Dutch" in calls[0][0]
+    # A piece whose reply is broken JSON is asked again alone, up to TRIES times, then fails.
+    calls.clear()
+    broken = [0]
+    def flaky(door, model, system, user):
+        calls.append(user)
+        if user.startswith("a") and broken[0] < TRIES - 1:  # every piece fails all but its last try
+            broken[0] += 1
+            return json.loads("{broken")
+        broken[0] = 0
+        return {"summary": "s"}
+    assert draft_notes("a\n" * CHUNK_CHARS, "fr", "d", "m", flaky)["summary"] == "s"
+    assert len(calls) == 2 * TRIES + 1, len(calls)
+    try:
+        draft_notes("short", "nl", "d", "m", lambda *a: json.loads("{"))
+        raise AssertionError("a piece broken every time must fail the draft")
+    except ValueError:
+        pass
 
     # The state decision per folder.
     meta = {"audio": "rec.webm"}
