@@ -47,11 +47,23 @@ CREDS_FILE = Path.home() / ".config/hai/pod-meetings.json"
 CREDS_KEYS = ("id", "secret", "pod")
 INBOX = "meetings/inbox/"
 LANGUAGES = {"nl": "Dutch", "en": "English", "fr": "French"}
-# A transcript piece per request. Pieces are drafted blind to each other and merged from their
-# JSON alone, which loses who said what and duplicates items, so a meeting should fit in one:
-# 60000 chars is about 15k tokens, some 1h45 of talk, inside the Tiiny's 131k window.
-# shortcut: fixed, not read from the box's window; lower it for a box with a window under 32k.
-CHUNK_CHARS = 60000
+# A transcript piece per request, sized from the window of the model that runs (the door's
+# /v1/models lists it as hai_box.window). Pieces are drafted blind to each other and merged
+# from their JSON alone, which loses who said what and duplicates items, so the larger the
+# piece the better, up to what the model still reads closely.
+OUTPUT_TOKENS = 3000  # the reply's cap (max_tokens)
+PROMPT_TOKENS = 600  # the system prompt and the participants line, with room to spare
+CHARS_PER_TOKEN = 3  # cautious: Dutch and French spend more tokens per character than English
+FALLBACK_WINDOW = 8192  # a model that does not say: the smallest window a chat model runs with
+# Past this a small model drops details from the middle of a long input. shortcut: a judgment,
+# not measured on our meetings; raise it once a long meeting drafts well in one piece.
+PIECE_TOKENS_MAX = 32768
+
+
+def piece_chars(window: int | None) -> int:
+    """The longest transcript piece, in characters, one request to a `window`-token model takes."""
+    room = (window if isinstance(window, int) and window > 0 else FALLBACK_WINDOW) - OUTPUT_TOKENS - PROMPT_TOKENS
+    return max(2000, min(room, PIECE_TOKENS_MAX) * CHARS_PER_TOKEN)
 SUMMARY_MAX, ITEM_MAX, ITEMS_MAX = 4000, 400, 30
 
 DRAFT_PROMPT = (
@@ -337,7 +349,7 @@ def extract_json(reply: str):
 
 def ask(door: str, model: str, system: str, user: str) -> dict:
     live_translate.DOOR = door
-    body = json.dumps({"model": model, "temperature": 0.2, "max_tokens": 3000,
+    body = json.dumps({"model": model, "temperature": 0.2, "max_tokens": OUTPUT_TOKENS,
                        "chat_template_kwargs": {"enable_thinking": False},
                        "messages": [{"role": "system", "content": system},
                                     {"role": "user", "content": user}]}).encode()
@@ -351,7 +363,7 @@ TRIES = 3  # the box model's JSON is sometimes broken; one bad piece must not th
 
 
 def draft_notes(transcript: str, language: str, door: str, model: str, ask_fn=ask,
-                participants: list | None = None) -> dict:
+                participants: list | None = None, window: int | None = None) -> dict:
     lang = LANGUAGES.get(language, "the language the meeting was held in")
     system = DRAFT_PROMPT.format(language=lang)
 
@@ -366,7 +378,7 @@ def draft_notes(transcript: str, language: str, door: str, model: str, ask_fn=as
                 if not left:
                     raise
 
-    parts = [asked(system, lead + c, c) for c in chunk(transcript, CHUNK_CHARS)]
+    parts = [asked(system, lead + c, c) for c in chunk(transcript, piece_chars(window))]
     if len(parts) == 1:
         return parts[0]
     if not parts:
@@ -473,7 +485,7 @@ def write_results(put, folder: str, transcript: str, draft: dict) -> None:
     put(folder + "done", b"", "text/plain")
 
 
-def process_folder(pod: Pod, folder: str, door: str, model: str) -> str:
+def process_folder(pod: Pod, folder: str, door: str, model: str, window: int | None = None) -> str:
     """Returns what happened; raises on a failure so the folder is retried next run."""
     names = {name_of(u) for u in pod.children(folder)}
     meta = None
@@ -497,9 +509,20 @@ def process_folder(pod: Pod, folder: str, door: str, model: str) -> str:
         # better: mark the folder for good instead of downloading it again every pass.
         pod.put(folder + "failed", b"no speech in the recording\n", "text/plain")
         return "failed: no speech in the recording"
-    draft = draft_notes(transcript, language, door, model, participants=people)
+    draft = draft_notes(transcript, language, door, model, participants=people, window=window)
     write_results(pod.put, folder, transcript, draft)
     return "done"
+
+
+def box_model(door: str, listing: dict | None = None) -> tuple[str, int | None]:
+    """The chat model running on the owner's box, and its window in tokens when the box says."""
+    if listing is None:
+        with urllib.request.urlopen(f"{door}/v1/models", timeout=10) as resp:
+            listing = json.load(resp)
+    model = meeting_inbox.running_box_model(door, listing)
+    rows = [m for m in listing.get("data", []) if m.get("id") == model]
+    window = (rows[0].get("hai_box") or {}).get("window") if rows else None
+    return model, window if isinstance(window, int) else None
 
 
 def run_once(pod: Pod, door: str) -> int:
@@ -507,13 +530,13 @@ def run_once(pod: Pod, door: str) -> int:
     failed = 0
     try:
         folders = [u for u in pod.children(pod.root + INBOX) if u.endswith("/")]
-        model = meeting_inbox.running_box_model(door) if folders else ""
+        model, window = box_model(door) if folders else ("", None)
     except (urllib.error.URLError, OSError, KeyError, ValueError, SystemExit) as e:
         log(f"inbox not read: {type(e).__name__}: {e}")
         return 1
     for folder in folders:
         try:
-            verdict = process_folder(pod, folder, door, model)
+            verdict = process_folder(pod, folder, door, model, window)
             log(f"{name_of(folder)}: {verdict}")
         except Exception as e:  # noqa: BLE001  one folder's failure must not stop the others
             failed += 1
@@ -595,11 +618,24 @@ def selftest() -> None:
     # A long transcript is asked in pieces, then combined once.
     calls = []
     fake = lambda door, model, system, user: (calls.append((system, user)), {"summary": "s", "next": [user[:1]]})[1]
-    draft_notes("a\n" * CHUNK_CHARS, "fr", "d", "m", fake)
+    draft_notes("a\n" * piece_chars(None), "fr", "d", "m", fake)
     assert len(calls) == 3 and "French" in calls[0][0] and calls[-1][0].startswith("Below are"), len(calls)
     calls.clear()
     draft_notes("short", "nl", "d", "m", fake)
     assert len(calls) == 1 and "Dutch" in calls[0][0]
+    # The piece follows the running model's window: one request where the window holds the
+    # meeting, several where it does not, a cautious size when the model does not say.
+    meeting = "Neil: something said in the meeting\n" * 600  # about 21k chars, ~28 minutes
+    for window, pieces in ((131072, 1), (32768, 1), (8192, 2), (None, 2), (0, 2)):
+        calls.clear()
+        draft_notes(meeting, "en", "d", "m", fake, window=window)
+        assert len(calls) == pieces + (pieces > 1), (window, len(calls))
+    assert piece_chars(10**7) == PIECE_TOKENS_MAX * CHARS_PER_TOKEN and piece_chars(4000) == 2000
+    listing = {"data": [{"id": "box/t/a", "hai_box": {"loaded": False, "window": 4096}},
+                        {"id": "box/t/b", "hai_box": {"loaded": True, "window": 131072}}]}
+    assert box_model("d", listing) == ("box/t/b", 131072)
+    listing["data"][1]["hai_box"].pop("window")
+    assert box_model("d", listing) == ("box/t/b", None)
     # An item stands only on a quote of the transcript; a bare string or an invented quote is dropped.
     said = "Neil: We'll come to that.\nAlexandre: I should make something for a timer in here, maybe."
     reply = {"summary": "s", "next": [
@@ -622,7 +658,7 @@ def selftest() -> None:
             return json.loads("{broken")
         broken[0] = 0
         return {"summary": "s"}
-    assert draft_notes("a\n" * CHUNK_CHARS, "fr", "d", "m", flaky)["summary"] == "s"
+    assert draft_notes("a\n" * piece_chars(None), "fr", "d", "m", flaky)["summary"] == "s"
     assert len(calls) == 2 * TRIES + 1, len(calls)
     try:
         draft_notes("short", "nl", "d", "m", lambda *a: json.loads("{"))
