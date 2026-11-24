@@ -47,17 +47,27 @@ CREDS_FILE = Path.home() / ".config/hai/pod-meetings.json"
 CREDS_KEYS = ("id", "secret", "pod")
 INBOX = "meetings/inbox/"
 LANGUAGES = {"nl": "Dutch", "en": "English", "fr": "French"}
-CHUNK_CHARS = 12000  # a transcript piece per request; the Tiiny's context is the limit
+# A transcript piece per request. Pieces are drafted blind to each other and merged from their
+# JSON alone, which loses who said what and duplicates items, so a meeting should fit in one:
+# 60000 chars is about 15k tokens, some 1h45 of talk, inside the Tiiny's 131k window.
+# shortcut: fixed, not read from the box's window; lower it for a box with a window under 32k.
+CHUNK_CHARS = 60000
 SUMMARY_MAX, ITEM_MAX, ITEMS_MAX = 4000, 400, 30
 
 DRAFT_PROMPT = (
     "You write the notes of a meeting from its transcript. The transcript comes from speech"
-    " recognition and may contain misheard words: use the intended meaning, and never invent"
-    " what was not said. Write in {language}. Reply with one JSON object and nothing else:"
+    " recognition and may contain misheard words and speaker labels on the wrong line: use the"
+    " intended meaning, and never invent what was not said. Write in {language}. Reply with one"
+    " JSON object and nothing else:"
     ' {{"summary": "a short paragraph on what the meeting was about and decided",'
-    ' "next": ["each next step, with who does it when the transcript says so"],'
-    ' "agreements": ["each thing the people agreed on"],'
-    ' "lessons": ["each lesson learned"]}}. A list with nothing to say is [].'
+    ' "next": [ITEM], "agreements": [ITEM], "lessons": [ITEM]}},'
+    ' where each ITEM is {{"text": "the item", "quote": "a few exact words of the transcript it'
+    ' rests on, copied letter for letter"}}.'
+    " A next step is an action still to do after the meeting, with the person who does it when"
+    " the transcript names one; something done during the meeting is not a next step. An"
+    " agreement is something the people explicitly settled together, not one person's statement."
+    " A lesson is an insight the people drew. Leave out facts and claims merely mentioned."
+    " Fewer, sure items beat many: a list with nothing certain to say is []."
 )
 COMBINE_PROMPT = (
     "Below are the notes of consecutive parts of one meeting, each a JSON object. Merge them"
@@ -286,15 +296,34 @@ def decide(meta: dict | None, names: set[str]) -> str:
 
 # --- the work on one recording ---
 
-def coerce_draft(obj) -> dict:
-    """What the applet reads: a summary string and three lists of strings, whatever came back."""
+def _plain(text: str) -> str:
+    """Lowercase words only, so a quote matches the transcript whatever its punctuation."""
+    return " ".join(re.findall(r"\w+", text.casefold()))
+
+
+def coerce_draft(obj, source: str | None = None) -> dict:
+    """What the applet reads: a summary string and three lists of strings, whatever came back.
+
+    With `source`, an item survives only if it carries a quote found in that transcript text:
+    the model's own claims and items about nothing said are dropped, not shown as agreed.
+    """
     obj = obj if isinstance(obj, dict) else {}
     summary = obj.get("summary")
     out = {"summary": summary.strip()[:SUMMARY_MAX] if isinstance(summary, str) else ""}
+    said = _plain(source) if source is not None else ""
     for key in ("next", "agreements", "lessons"):
         items = obj.get(key)
-        items = items if isinstance(items, list) else []
-        out[key] = [i.strip()[:ITEM_MAX] for i in items if isinstance(i, str) and i.strip()][:ITEMS_MAX]
+        kept = []
+        for i in items if isinstance(items, list) else []:
+            text = i.get("text") if isinstance(i, dict) else i if source is None else None
+            if not isinstance(text, str) or not text.strip():
+                continue
+            if source is not None:
+                quote = _plain(i.get("quote") if isinstance(i.get("quote"), str) else "")
+                if len(quote) < 8 or quote not in said:
+                    continue
+            kept.append(text.strip()[:ITEM_MAX])
+        out[key] = kept[:ITEMS_MAX]
     return out
 
 
@@ -315,31 +344,36 @@ def ask(door: str, model: str, system: str, user: str) -> dict:
     answer = live_translate.post("/v1/chat/completions", body, "application/json", timeout=600)
     if "error" in answer:
         raise RuntimeError(answer["error"].get("message", "the door refused the chat request"))
-    return coerce_draft(extract_json(answer["choices"][0]["message"]["content"]))
+    return extract_json(answer["choices"][0]["message"]["content"])
 
 
 TRIES = 3  # the box model's JSON is sometimes broken; one bad piece must not throw the others away
 
 
-def draft_notes(transcript: str, language: str, door: str, model: str, ask_fn=ask) -> dict:
+def draft_notes(transcript: str, language: str, door: str, model: str, ask_fn=ask,
+                participants: list | None = None) -> dict:
     lang = LANGUAGES.get(language, "the language the meeting was held in")
     system = DRAFT_PROMPT.format(language=lang)
 
-    def asked(system: str, user: str) -> dict:
+    people = [p.strip() for p in participants or [] if isinstance(p, str) and p.strip()]
+    lead = f"Participants: {', '.join(people)}.\n\nTranscript:\n" if people else ""
+
+    def asked(system: str, user: str, source: str | None) -> dict:
         for left in range(TRIES - 1, -1, -1):
             try:
-                return ask_fn(door, model, system, user)
+                return coerce_draft(ask_fn(door, model, system, user), source)
             except ValueError:  # json.JSONDecodeError included: asked again, the same piece alone
                 if not left:
                     raise
 
-    parts = [asked(system, c) for c in chunk(transcript, CHUNK_CHARS)]
+    parts = [asked(system, lead + c, c) for c in chunk(transcript, CHUNK_CHARS)]
     if len(parts) == 1:
         return parts[0]
     if not parts:
         return coerce_draft({})
+    # The pieces' items are already checked against their own text; the merge only rewords them.
     return asked(COMBINE_PROMPT.format(language=lang),
-                 "\n\n".join(json.dumps(p, ensure_ascii=False) for p in parts))
+                 "\n\n".join(json.dumps(p, ensure_ascii=False) for p in parts), None)
 
 
 def asr_name() -> str:
@@ -463,7 +497,7 @@ def process_folder(pod: Pod, folder: str, door: str, model: str) -> str:
         # better: mark the folder for good instead of downloading it again every pass.
         pod.put(folder + "failed", b"no speech in the recording\n", "text/plain")
         return "failed: no speech in the recording"
-    draft = draft_notes(transcript, language, door, model)
+    draft = draft_notes(transcript, language, door, model, participants=people)
     write_results(pod.put, folder, transcript, draft)
     return "done"
 
@@ -566,6 +600,18 @@ def selftest() -> None:
     calls.clear()
     draft_notes("short", "nl", "d", "m", fake)
     assert len(calls) == 1 and "Dutch" in calls[0][0]
+    # An item stands only on a quote of the transcript; a bare string or an invented quote is dropped.
+    said = "Neil: We'll come to that.\nAlexandre: I should make something for a timer in here, maybe."
+    reply = {"summary": "s", "next": [
+        {"text": "Alexandre could add a timer", "quote": "I should make something for a TIMER in here"},
+        {"text": "invented", "quote": "the .nc domain was cancelled in 1993"},
+        {"text": "too short", "quote": "a"}, "a bare string"]}
+    calls.clear()
+    d = draft_notes(said, "en", "d", "m", lambda *a: (calls.append(a[3]), reply)[1], participants=["Alex", " Neil"])
+    assert d["next"] == ["Alexandre could add a timer"], d
+    assert calls[0].startswith("Participants: Alex, Neil.\n\nTranscript:\nNeil:"), calls[0][:60]
+    # The merge of pieces is not checked again: its input is JSON, not the transcript.
+    assert coerce_draft({"next": ["merged", {"text": "obj"}]})["next"] == ["merged", "obj"]
     # A piece whose reply is broken JSON is asked again alone, up to TRIES times, then fails.
     calls.clear()
     broken = [0]
