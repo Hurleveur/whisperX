@@ -55,9 +55,11 @@ OUTPUT_TOKENS = 3000  # the reply's cap (max_tokens)
 PROMPT_TOKENS = 600  # the system prompt and the participants line, with room to spare
 CHARS_PER_TOKEN = 3  # cautious: Dutch and French spend more tokens per character than English
 FALLBACK_WINDOW = 8192  # a model that does not say: the smallest window a chat model runs with
-# Past this a small model drops details from the middle of a long input. shortcut: a judgment,
-# not measured on our meetings; raise it once a long meeting drafts well in one piece.
-PIECE_TOKENS_MAX = 32768
+# Past this a small model drops details from the middle of a long input. Measured once: a
+# 3-hour English meeting (100123 chars) drafted in one piece on the Tiiny's 27B in 243 s with
+# 10 quoted items, where two pieces took 802 s and the merge lost the owners (2026-11-25).
+# shortcut: one meeting; raise it again once a longer one drafts as well.
+PIECE_TOKENS_MAX = 40000
 
 
 def piece_chars(window: int | None) -> int:
