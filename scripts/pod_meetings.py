@@ -317,6 +317,9 @@ def decide(meta: dict | None, names: set[str]) -> str:
 
 # --- the work on one recording ---
 
+SPEAKER_LABEL = re.compile(r"^[\w-]{1,40}:[ \t]*", re.M)  # read_transcript's "Neil: ", "SPEAKER_01: "
+
+
 def _plain(text: str) -> str:
     """Lowercase words only, so a quote matches the transcript whatever its punctuation."""
     return " ".join(re.findall(r"\w+", text.casefold()))
@@ -331,7 +334,8 @@ def coerce_draft(obj, source: str | None = None) -> dict:
     obj = obj if isinstance(obj, dict) else {}
     summary = obj.get("summary")
     out = {"summary": summary.strip()[:SUMMARY_MAX] if isinstance(summary, str) else ""}
-    said = _plain(source) if source is not None else ""
+    # Speaker labels are not words said: a quote over one speaker's next line skips them.
+    said = _plain(SPEAKER_LABEL.sub("", source)) if source is not None else ""
     for key in ("next", "agreements", "lessons"):
         items = obj.get(key)
         kept = []
@@ -340,8 +344,9 @@ def coerce_draft(obj, source: str | None = None) -> dict:
             if not isinstance(text, str) or not text.strip():
                 continue
             if source is not None:
-                quote = _plain(i.get("quote") if isinstance(i.get("quote"), str) else "")
-                if len(quote) < 8 or quote not in said:
+                quote = i.get("quote") if isinstance(i.get("quote"), str) else ""
+                parts = [p for p in map(_plain, re.split(r"\.\.\.|…", quote)) if p]
+                if sum(map(len, parts)) < 8 or not all(p in said for p in parts):
                     continue
             kept.append(text.strip()[:ITEM_MAX])
         out[key] = kept[:ITEMS_MAX]
@@ -662,6 +667,16 @@ def selftest() -> None:
     d = draft_notes(said, "en", "d", "m", lambda *a: (calls.append(a[3]), reply)[1], participants=["Alex", " Neil"])
     assert d["next"] == ["Alexandre could add a timer"], d
     assert calls[0].startswith("Participants: Alex, Neil.\n\nTranscript:\nNeil:"), calls[0][:60]
+    # A quote may run over one speaker's consecutive lines, or skip words with "...": its
+    # parts are each found once the speaker labels are out (2026-11-23: 9 of 10 items dropped).
+    said = "Neil: So the chapter definition.\nNeil: I'm defining the elements.\nSPEAKER_01: Yes, the red flag."
+    reply = {"summary": "s", "agreements": [
+        {"text": "over two lines", "quote": "So the chapter definition. I'm defining the elements."},
+        {"text": "with a gap", "quote": "So the chapter definition ... the red flag"},
+        {"text": "one part invented", "quote": "So the chapter definition … the green flag"},
+        {"text": "label as a word", "quote": "definition neil i m defining"}]}
+    d = draft_notes(said, "en", "d", "m", lambda *a: reply)
+    assert d["agreements"] == ["over two lines", "with a gap"], d
     # The merge of pieces is not checked again: its input is JSON, not the transcript.
     assert coerce_draft({"next": ["merged", {"text": "obj"}]})["next"] == ["merged", "obj"]
     # A piece whose reply is broken JSON is asked again alone, up to TRIES times, then fails.
