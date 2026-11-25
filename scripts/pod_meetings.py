@@ -64,6 +64,15 @@ def piece_chars(window: int | None) -> int:
     """The longest transcript piece, in characters, one request to a `window`-token model takes."""
     room = (window if isinstance(window, int) and window > 0 else FALLBACK_WINDOW) - OUTPUT_TOKENS - PROMPT_TOKENS
     return max(2000, min(room, PIECE_TOKENS_MAX) * CHARS_PER_TOKEN)
+
+
+def even_pieces(text: str, size: int) -> list[str]:
+    """As few pieces of at most `size` chars as `chunk` gives, cut as evenly as the lines allow."""
+    count = max(1, -(-len(text) // size))
+    longest = max((len(line) for line in text.splitlines(keepends=True)), default=0)
+    return chunk(text, min(size, -(-len(text) // count) + longest))
+
+
 SUMMARY_MAX, ITEM_MAX, ITEMS_MAX = 4000, 400, 30
 
 DRAFT_PROMPT = (
@@ -378,7 +387,7 @@ def draft_notes(transcript: str, language: str, door: str, model: str, ask_fn=as
                 if not left:
                     raise
 
-    parts = [asked(system, lead + c, c) for c in chunk(transcript, piece_chars(window))]
+    parts = [asked(system, lead + c, c) for c in even_pieces(transcript, piece_chars(window))]
     if len(parts) == 1:
         return parts[0]
     if not parts:
@@ -631,6 +640,13 @@ def selftest() -> None:
         draft_notes(meeting, "en", "d", "m", fake, window=window)
         assert len(calls) == pieces + (pieces > 1), (window, len(calls))
     assert piece_chars(10**7) == PIECE_TOKENS_MAX * CHARS_PER_TOKEN and piece_chars(4000) == 2000
+    # A meeting just over one piece is cut in even halves, never a full piece and a short tail
+    # (2026-11-23: 98268 + 1855 chars, the tail's notes merged blind into the rest).
+    line = "Neil: something said in the meeting\n"
+    over = line * (piece_chars(None) // len(line) + 2)
+    sizes = [len(p) for p in even_pieces(over, piece_chars(None))]
+    assert len(sizes) == 2 and abs(sizes[0] - sizes[1]) <= 2 * len(line), sizes
+    assert even_pieces("", 10) == [] and "".join(even_pieces(meeting, 5000)) == meeting
     listing = {"data": [{"id": "box/t/a", "hai_box": {"loaded": False, "window": 4096}},
                         {"id": "box/t/b", "hai_box": {"loaded": True, "window": 131072}}]}
     assert box_model("d", listing) == ("box/t/b", 131072)
