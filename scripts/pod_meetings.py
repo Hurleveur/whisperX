@@ -539,7 +539,33 @@ def write_results(put, folder: str, transcript: str, draft: dict) -> None:
     put(folder + "done", b"", "text/plain")
 
 
-def process_folder(pod: Pod, folder: str, door: str, model: str, window: int | None = None) -> str:
+def meeting_parts(folders: list[str], mid: str) -> list[str]:
+    """One meeting's inbox folders in the order sent: <id>, then <id>-2, <id>-3 (a paused
+    recording goes up one part per folder)."""
+    mine = [u for u in folders if re.fullmatch(re.escape(mid) + r"(-\d+)?", name_of(u))]
+    return sorted(mine, key=lambda u: int(name_of(u)[len(mid) + 1:] or 1))
+
+
+def whole_transcript(children, get_bytes, parts: list[str], folder: str, transcript: str) -> str | None:
+    """The meeting's transcript, every part in order; None while another part is still to be
+    heard, since the last part heard drafts the whole meeting. A part the phone already took
+    into a note has no transcript.txt left and is missed."""
+    said = []
+    for p in parts:
+        if p == folder:
+            said.append(transcript)
+            continue
+        names = {name_of(u) for u in children(p)}
+        if "failed" in names:
+            continue
+        if "done" not in names:
+            return None
+        said.append(get_bytes(p + "transcript.txt").decode() if "transcript.txt" in names else "")
+    return "\n\n".join(s.strip() for s in said if s.strip())
+
+
+def process_folder(pod: Pod, folder: str, door: str, model: str, window: int | None = None,
+                   folders: list[str] = ()) -> str:
     """Returns what happened; raises on a failure so the folder is retried next run."""
     names = {name_of(u) for u in pod.children(folder)}
     meta = None
@@ -558,14 +584,25 @@ def process_folder(pod: Pod, folder: str, door: str, model: str, window: int | N
             shutil.copyfileobj(r, f)
         people = meta.get("participants") if isinstance(meta.get("participants"), list) else []
         transcript = transcribe(audio, language, people)
-    if not transcript.strip():
+    mid = meta.get("id") if isinstance(meta.get("id"), str) else ""
+    parts = meeting_parts(list(folders), mid) if mid else []
+    parts = parts if folder in parts else [folder]
+    whole = whole_transcript(pod.children, pod.get_bytes, parts, folder, transcript)
+    if not transcript.strip() and not whole:
         # meeting.sh caches the empty result under the audio stem, so a retry can never do
         # better: mark the folder for good instead of downloading it again every pass.
         pod.put(folder + "failed", b"no speech in the recording\n", "text/plain")
         return "failed: no speech in the recording"
-    draft = draft_notes(transcript, language, door, model, participants=people, window=window)
+    if whole is None:
+        # An empty draft: the phone shows nothing for this part, and the part heard last
+        # brings the whole meeting's.
+        write_results(pod.put, folder, transcript, coerce_draft({}))
+        return "done, drafted with the meeting's last part"
+    draft = draft_notes(whole, language, door, model, participants=people, window=window)
+    # The phone drops the proposals of every part named here: one meeting, one draft.
+    draft["parts"] = [name_of(p) for p in parts]
     write_results(pod.put, folder, transcript, draft)
-    return "done"
+    return "done" if len(parts) == 1 else f"done, drafted the whole meeting ({len(parts)} parts)"
 
 
 def box_model(door: str, listing: dict | None = None) -> tuple[str, int | None]:
@@ -590,7 +627,7 @@ def run_once(pod: Pod, door: str) -> int:
         return 1
     for folder in folders:
         try:
-            verdict = process_folder(pod, folder, door, model, window)
+            verdict = process_folder(pod, folder, door, model, window, folders)
             log(f"{name_of(folder)}: {verdict}")
         except Exception as e:  # noqa: BLE001  one folder's failure must not stop the others
             failed += 1
@@ -771,6 +808,24 @@ def selftest() -> None:
     assert decide(meta, {"meta.json"}).startswith("skip"), "audio still uploading"
     assert decide({"audio": 5}, {"meta.json"}).startswith("skip")
     assert decide(meta, {"meta.json", "rec.webm", "failed"}) == "skip: failed"
+
+    # A paused meeting: its folders in the order sent, then one transcript once every part is heard.
+    ib = "http://p/inbox/"
+    listed = [ib + n + "/" for n in ("m-10", "m", "mx", "m-2", "other", "m-x")]
+    assert meeting_parts(listed, "m") == [ib + "m/", ib + "m-2/", ib + "m-10/"], meeting_parts(listed, "m")
+    parts = [ib + "m/", ib + "m-2/", ib + "m-3/"]
+    files = {ib + "m/": {"done": b"", "transcript.txt": b"Neil: one\n"}, ib + "m-2/": {"meta.json": b"{}"}}
+    kids = lambda p: [p + n for n in files.get(p, {})]
+    got = lambda u: files[u.rsplit("/", 1)[0] + "/"][u.rsplit("/", 1)[1]]
+    assert whole_transcript(kids, got, parts, ib + "m-3/", "Alex: three") is None, "part 2 still to be heard"
+    files[ib + "m-2/"] = {"failed": b""}
+    assert whole_transcript(kids, got, parts, ib + "m-3/", "Alex: three") == "Neil: one\n\nAlex: three"
+    files[ib + "m-2/"] = {"done": b"", "transcript.txt": b"Nico: two"}
+    assert whole_transcript(kids, got, parts, ib + "m-3/", "Alex: three") == "Neil: one\n\nNico: two\n\nAlex: three"
+    assert whole_transcript(kids, got, parts[:2], ib + "m/", "Neil: again") == "Neil: again\n\nNico: two"
+    assert whole_transcript(kids, got, parts, ib + "m/", "Neil: again") is None, "m-3 listed, not uploaded yet"
+    files[ib + "m/"] = {"done": b""}
+    assert whole_transcript(kids, got, parts[:2], ib + "m-2/", "") == "", "a part already taken by the phone is missed"
 
     # Write order: done last, with the content types the applet reads.
     puts = []
