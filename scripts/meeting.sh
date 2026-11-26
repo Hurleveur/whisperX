@@ -38,7 +38,8 @@ Environment:
                    first minutes, else large-v3; without a GPU large-v3-turbo)
   BATCH_SIZE       whisperX batch size (default: 4; lower it if VRAM is tight)
   WHISPER_COMPUTE  float16 or int8 (default on a GPU: float16 with 5 GB free,
-                   else int8, which fits beside a model already on the card)
+                   else int8, which fits beside a model already on the card;
+                   a failed float16 run is heard again in int8)
   WHISPER_HOTWORDS_FILE  words whisper should expect, such as product and
                    people names, comma-separated (default:
                    ~/.local/share/whisperx/hotwords.txt; skipped when absent)
@@ -127,16 +128,26 @@ else
 
     # A run that dies with no traceback is usually the OOM killer: earlyoom takes
     # this out around 3.5 GB RSS when free RAM runs low.
-    "$repo/.venv/bin/whisperx" "$audio" \
-        --model "$WHISPER_MODEL" \
-        --diarize \
-        --speaker_embeddings \
-        --batch_size "${BATCH_SIZE:-4}" \
-        --compute_type "$compute" \
-        --output_dir "$out" \
-        --output_format all \
-        ${hot[@]+"${hot[@]}"} \
-        "$@"
+    extra=("$@")
+    hear() {
+        "$repo/.venv/bin/whisperx" "$audio" \
+            --model "$WHISPER_MODEL" \
+            --diarize \
+            --speaker_embeddings \
+            --batch_size "${BATCH_SIZE:-4}" \
+            --compute_type "$1" \
+            --output_dir "$out" \
+            --output_format all \
+            ${hot[@]+"${hot[@]}"} \
+            ${extra[@]+"${extra[@]}"}
+    }
+    # float16 fits a 6 GB card for most recordings yet ran out of memory on one 13-minute
+    # part of 2026-11-26 with the card otherwise empty, every retry; int8 heard it.
+    if ! hear "$compute"; then
+        if [ "$compute" != float16 ]; then exit 1; fi
+        echo "whisperX failed in float16, trying again in int8" >&2
+        hear int8
+    fi
 fi
 
 if [ -n "$transcribe_only" ]; then echo "$json"; exit 0; fi
