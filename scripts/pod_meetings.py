@@ -393,7 +393,9 @@ def ask(door: str, model: str, system: str, user: str) -> dict:
                        "chat_template_kwargs": {"enable_thinking": False},
                        "messages": [{"role": "system", "content": system},
                                     {"role": "user", "content": user}]}).encode()
-    answer = live_translate.post("/v1/chat/completions", body, "application/json", timeout=600)
+    # The door has no read timeout and queues a call behind the box's other work: one
+    # 120000-char piece took 243 s alone and over 600 s on a shared Tiiny (2026-11-26).
+    answer = live_translate.post("/v1/chat/completions", body, "application/json", timeout=1800)
     if "error" in answer:
         raise RuntimeError(answer["error"].get("message", "the door refused the chat request"))
     return extract_json(answer["choices"][0]["message"]["content"])
