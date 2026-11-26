@@ -62,6 +62,14 @@ FALLBACK_WINDOW = 8192  # a model that does not say: the smallest window a chat 
 PIECE_TOKENS_MAX = 40000
 
 
+def draft_size(chars: int) -> dict:
+    """How long a draft of `chars` of transcript is asked to be. Told "more in a long meeting"
+    and "at most twelve", the box model gave a 2-hour meeting one paragraph and five nuggets
+    (2026-11-26), so it is given numbers. About 700 chars are one minute of talk."""
+    paras = max(1, min(6, round(chars / 18000)))
+    return {"paras": paras, "words": paras * 90, "nuggets": max(3, min(12, round(chars / 9000)))}
+
+
 def piece_chars(window: int | None) -> int:
     """The longest transcript piece, in characters, one request to a `window`-token model takes."""
     room = (window if isinstance(window, int) and window > 0 else FALLBACK_WINDOW) - OUTPUT_TOKENS - PROMPT_TOKENS
@@ -82,8 +90,8 @@ DRAFT_PROMPT = (
     " recognition and may contain misheard words and speaker labels on the wrong line: use the"
     " intended meaning, and never invent what was not said. Write in {language}. Reply with one"
     " JSON object and nothing else:"
-    ' {{"summary": "what the meeting covered and decided: one short paragraph per main topic,'
-    ' at most six, each saying what was said about it and settled",'
+    ' {{"summary": "what the meeting covered and decided, in {paras} paragraphs and about {words}'
+    ' words: a paragraph per main topic, saying what was said about it and settled",'
     ' "next": [ITEM], "agreements": [ITEM], "lessons": [ITEM], "nuggets": ["a line said"]}},'
     ' where each ITEM is {{"text": "the item", "quote": "a few exact words of the transcript it'
     ' rests on, copied letter for letter"}}.'
@@ -92,18 +100,19 @@ DRAFT_PROMPT = (
     " or \"\" when that is not clear. Something done during the meeting is not a next step. An"
     " agreement is something the people explicitly settled together, not one person's statement."
     " A lesson is an insight the people drew. Leave out facts and claims merely mentioned."
-    " A nugget is one of the best things said, at most twelve, more in a long meeting than a"
-    " short one: a sharp insight, a striking way to"
-    " put something, a line that sums the meeting up; one to three sentences copied exactly"
+    " Give {nuggets} nuggets: the best things said, each a sharp insight, a striking way to put"
+    " something or a line that sums the meeting up, that still means something read alone a"
+    " month later (never a joke, an aside or small talk); one to three sentences copied exactly"
     " from the transcript, letter for letter, in its language, without its speaker label: never"
     " reworded, shortened, translated or stitched together from two places."
-    " Fewer, sure items beat many: a list with nothing certain to say is []."
+    " In the other lists, fewer, sure items beat many: a list with nothing certain to say is []."
 )
 COMBINE_PROMPT = (
     "Below are the notes of consecutive parts of one meeting, each a JSON object. Merge them"
-    " into the notes of the whole meeting: one summary, a short paragraph per main topic and at most six, and each list without"
+    " into the notes of the whole meeting: one summary in {paras} paragraphs and about {words} words, a paragraph per main"
+    " topic, and each list without"
     " duplicates; a next step starting with a name and a colon keeps them. Write in {language},"
-    " except the nuggets: keep at most twelve, each copied unchanged, letter for letter."
+    " except the nuggets: keep the best {nuggets}, each copied unchanged, letter for letter."
     " Reply with one JSON object and nothing else, with the"
     ' keys "summary" (string), "next", "agreements", "lessons" and "nuggets" (lists of strings).'
 )
@@ -419,7 +428,6 @@ TRIES = 3  # the box model's JSON is sometimes broken; one bad piece must not th
 def draft_notes(transcript: str, language: str, door: str, model: str, ask_fn=ask,
                 participants: list | None = None, window: int | None = None) -> dict:
     lang = LANGUAGES.get(language, "the language the meeting was held in")
-    system = DRAFT_PROMPT.format(language=lang)
 
     people = [p.strip() for p in participants or [] if isinstance(p, str) and p.strip()]
     lead = f"Participants: {', '.join(people)}.\n\nTranscript:\n" if people else ""
@@ -432,13 +440,14 @@ def draft_notes(transcript: str, language: str, door: str, model: str, ask_fn=as
                 if not left:
                     raise
 
-    parts = [asked(system, lead + c, c) for c in even_pieces(transcript, piece_chars(window))]
+    parts = [asked(DRAFT_PROMPT.format(language=lang, **draft_size(len(c))), lead + c, c)
+             for c in even_pieces(transcript, piece_chars(window))]
     if len(parts) == 1:
         return parts[0]
     if not parts:
         return coerce_draft({})
     # The pieces' items are already checked against their own text; the merge only rewords them.
-    return asked(COMBINE_PROMPT.format(language=lang),
+    return asked(COMBINE_PROMPT.format(language=lang, **draft_size(len(transcript))),
                  "\n\n".join(json.dumps(p, ensure_ascii=False) for p in parts), None)
 
 
@@ -719,6 +728,10 @@ def selftest() -> None:
     calls.clear()
     draft_notes("short", "nl", "d", "m", fake)
     assert len(calls) == 1 and "Dutch" in calls[0][0]
+    # A long meeting is asked for a longer summary and more nuggets, in numbers.
+    assert draft_size(90429) == {"paras": 5, "words": 450, "nuggets": 10}
+    assert draft_size(5) == {"paras": 1, "words": 90, "nuggets": 3} and draft_size(10 ** 6)["nuggets"] == 12
+    assert "Give 3 nuggets" in calls[0][0] and "1 paragraphs and about 90 words" in calls[0][0]
     # The piece follows the running model's window: one request where the window holds the
     # meeting, several where it does not, a cautious size when the model does not say.
     meeting = "Neil: something said in the meeting\n" * 600  # about 21k chars, ~28 minutes
