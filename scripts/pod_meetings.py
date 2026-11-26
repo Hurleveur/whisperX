@@ -83,7 +83,7 @@ DRAFT_PROMPT = (
     " intended meaning, and never invent what was not said. Write in {language}. Reply with one"
     " JSON object and nothing else:"
     ' {{"summary": "a short paragraph on what the meeting was about and decided",'
-    ' "next": [ITEM], "agreements": [ITEM], "lessons": [ITEM]}},'
+    ' "next": [ITEM], "agreements": [ITEM], "lessons": [ITEM], "nuggets": ["a line said"]}},'
     ' where each ITEM is {{"text": "the item", "quote": "a few exact words of the transcript it'
     ' rests on, copied letter for letter"}}.'
     " A next step is an action still to do after the meeting; its ITEM also has \"owner\": the"
@@ -91,14 +91,19 @@ DRAFT_PROMPT = (
     " or \"\" when that is not clear. Something done during the meeting is not a next step. An"
     " agreement is something the people explicitly settled together, not one person's statement."
     " A lesson is an insight the people drew. Leave out facts and claims merely mentioned."
+    " A nugget is one of the best things said, at most five: a sharp insight, a striking way to"
+    " put something, a line that sums the meeting up; one to three sentences copied exactly"
+    " from the transcript, letter for letter, in its language, without its speaker label: never"
+    " reworded, shortened, translated or stitched together from two places."
     " Fewer, sure items beat many: a list with nothing certain to say is []."
 )
 COMBINE_PROMPT = (
     "Below are the notes of consecutive parts of one meeting, each a JSON object. Merge them"
     " into the notes of the whole meeting: one summary paragraph, and each list without"
-    " duplicates; a next step starting with a name and a colon keeps them. Write in {language}."
+    " duplicates; a next step starting with a name and a colon keeps them. Write in {language},"
+    " except the nuggets: keep at most five, each copied unchanged, letter for letter."
     " Reply with one JSON object and nothing else, with the"
-    ' keys "summary" (string), "next", "agreements" and "lessons" (lists of strings).'
+    ' keys "summary" (string), "next", "agreements", "lessons" and "nuggets" (lists of strings).'
 )
 
 
@@ -331,10 +336,11 @@ def _plain(text: str) -> str:
 
 
 def coerce_draft(obj, source: str | None = None, participants: tuple = ()) -> dict:
-    """What the applet reads: a summary string and three lists of strings, whatever came back.
+    """What the applet reads: a summary string and four lists of strings, whatever came back.
 
     With `source`, an item survives only if it carries a quote found in that transcript text:
     the model's own claims and items about nothing said are dropped, not shown as agreed.
+    A nugget is its own quote, in one piece: a line reworded or stitched together is dropped.
     """
     obj = obj if isinstance(obj, dict) else {}
     summary = obj.get("summary")
@@ -358,16 +364,20 @@ def coerce_draft(obj, source: str | None = None, participants: tuple = ()) -> di
                 return n
         return next((s for o, s in reversed(starts) if o <= at), None)
 
-    for key in ("next", "agreements", "lessons"):
+    for key in ("next", "agreements", "lessons", "nuggets"):
         items = obj.get(key)
         kept = []
         for i in items if isinstance(items, list) else []:
-            text = i.get("text") if isinstance(i, dict) else i if source is None else None
+            text = i.get("text") if isinstance(i, dict) else i if source is None or key == "nuggets" else None
             if not isinstance(text, str) or not text.strip():
                 continue
             if source is not None:
-                quote = i.get("quote") if isinstance(i.get("quote"), str) else ""
-                parts = [_plain(SPEAKER_LABEL.sub("", p.strip())) for p in re.split(r"\.\.\.|…", quote)]
+                if key == "nuggets":
+                    text = SPEAKER_LABEL.sub("", text.strip())
+                    parts = [_plain(text)]
+                else:
+                    quote = i.get("quote") if isinstance(i.get("quote"), str) else ""
+                    parts = [_plain(SPEAKER_LABEL.sub("", p.strip())) for p in re.split(r"\.\.\.|…", quote)]
                 parts = [p for p in parts if p]
                 if sum(map(len, parts)) < 8 or not all(p in said for p in parts):
                     continue
@@ -649,12 +659,12 @@ def selftest() -> None:
     assert dpop_proof(key, "GET", url) != dpop_proof(key, "GET", url), "fresh jti each time"
 
     # Draft coercion.
-    assert coerce_draft(None) == coerce_draft("x") == {"summary": "", "next": [], "agreements": [], "lessons": []}
+    assert coerce_draft(None) == coerce_draft("x") == {"summary": "", "next": [], "agreements": [], "lessons": [], "nuggets": []}
     d = coerce_draft({"summary": " ok ", "next": ["a", 3, None, "  ", " b "], "agreements": "no",
                       "lessons": ["x" * 999] * 40, "extra": 1})
     assert d["summary"] == "ok" and d["next"] == ["a", "b"] and d["agreements"] == []
     assert len(d["lessons"]) == ITEMS_MAX and len(d["lessons"][0]) == ITEM_MAX and set(d) == {
-        "summary", "next", "agreements", "lessons"}
+        "summary", "next", "agreements", "lessons", "nuggets"}
     assert len(coerce_draft({"summary": "s" * 9999})["summary"]) == SUMMARY_MAX
     assert extract_json('Here:\n```json\n{"summary": "x"}\n```') == {"summary": "x"}
     # A long transcript is asked in pieces, then combined once.
@@ -722,6 +732,14 @@ def selftest() -> None:
     reply = {"summary": "s", "agreements": [
         {"text": "Roadmap", "quote": "Neil: Alexandre, can you send ... Alexandre: Sure."}]}
     assert draft_notes(said, "en", "d", "m", lambda *a: reply)["agreements"] == ["Roadmap"]
+    # A nugget stands only as words said, whole: reworded, stitched with "..." or too short is dropped.
+    reply = {"summary": "s", "nuggets": [
+        "I know what I need to do next, generate the menu.", "I know what I need to do, generate the menu.",
+        "I know what I need ... the menu", "Neil: Alexandre, can you send the roadmap to me?", "Sure.",
+        {"text": "Alexandre: Sure. SPEAKER_02: I will book", "quote": "x"}]}
+    assert draft_notes(said, "en", "d", "m", lambda *a: reply)["nuggets"] == [
+        "I know what I need to do next, generate the menu.", "Alexandre, can you send the roadmap to me?",
+    ], "a leading label goes; one inside is two lines stitched together"
     # The merge of pieces is not checked again: its input is JSON, not the transcript.
     assert coerce_draft({"next": ["merged", {"text": "obj"}]})["next"] == ["merged", "obj"]
     # A piece whose reply is broken JSON is asked again alone, up to TRIES times, then fails.
