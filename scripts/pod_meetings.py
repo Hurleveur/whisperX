@@ -75,14 +75,15 @@ def even_pieces(text: str, size: int) -> list[str]:
     return chunk(text, min(size, -(-len(text) // count) + longest))
 
 
-SUMMARY_MAX, ITEM_MAX, ITEMS_MAX = 4000, 400, 30
+SUMMARY_MAX, ITEM_MAX, ITEMS_MAX = 6000, 400, 30
 
 DRAFT_PROMPT = (
     "You write the notes of a meeting from its transcript. The transcript comes from speech"
     " recognition and may contain misheard words and speaker labels on the wrong line: use the"
     " intended meaning, and never invent what was not said. Write in {language}. Reply with one"
     " JSON object and nothing else:"
-    ' {{"summary": "a short paragraph on what the meeting was about and decided",'
+    ' {{"summary": "what the meeting covered and decided: one short paragraph per main topic,'
+    ' at most six, each saying what was said about it and settled",'
     ' "next": [ITEM], "agreements": [ITEM], "lessons": [ITEM], "nuggets": ["a line said"]}},'
     ' where each ITEM is {{"text": "the item", "quote": "a few exact words of the transcript it'
     ' rests on, copied letter for letter"}}.'
@@ -91,7 +92,8 @@ DRAFT_PROMPT = (
     " or \"\" when that is not clear. Something done during the meeting is not a next step. An"
     " agreement is something the people explicitly settled together, not one person's statement."
     " A lesson is an insight the people drew. Leave out facts and claims merely mentioned."
-    " A nugget is one of the best things said, at most five: a sharp insight, a striking way to"
+    " A nugget is one of the best things said, at most twelve, more in a long meeting than a"
+    " short one: a sharp insight, a striking way to"
     " put something, a line that sums the meeting up; one to three sentences copied exactly"
     " from the transcript, letter for letter, in its language, without its speaker label: never"
     " reworded, shortened, translated or stitched together from two places."
@@ -99,9 +101,9 @@ DRAFT_PROMPT = (
 )
 COMBINE_PROMPT = (
     "Below are the notes of consecutive parts of one meeting, each a JSON object. Merge them"
-    " into the notes of the whole meeting: one summary paragraph, and each list without"
+    " into the notes of the whole meeting: one summary, a short paragraph per main topic and at most six, and each list without"
     " duplicates; a next step starting with a name and a colon keeps them. Write in {language},"
-    " except the nuggets: keep at most five, each copied unchanged, letter for letter."
+    " except the nuggets: keep at most twelve, each copied unchanged, letter for letter."
     " Reply with one JSON object and nothing else, with the"
     ' keys "summary" (string), "next", "agreements", "lessons" and "nuggets" (lists of strings).'
 )
@@ -601,6 +603,9 @@ def process_folder(pod: Pod, folder: str, door: str, model: str, window: int | N
     draft = draft_notes(whole, language, door, model, participants=people, window=window)
     # The phone drops the proposals of every part named here: one meeting, one draft.
     draft["parts"] = [name_of(p) for p in parts]
+    # When it was written: the phone reads a part it already landed again only for a later
+    # draft, so a meeting drafted again (a better prompt, a fixed part) reaches it on Check.
+    draft["drafted"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     write_results(pod.put, folder, transcript, draft)
     return "done" if len(parts) == 1 else f"done, drafted the whole meeting ({len(parts)} parts)"
 
