@@ -86,8 +86,9 @@ DRAFT_PROMPT = (
     ' "next": [ITEM], "agreements": [ITEM], "lessons": [ITEM]}},'
     ' where each ITEM is {{"text": "the item", "quote": "a few exact words of the transcript it'
     ' rests on, copied letter for letter"}}.'
-    " A next step is an action still to do after the meeting, with the person who does it when"
-    " the transcript names one; something done during the meeting is not a next step. An"
+    " A next step is an action still to do after the meeting; its ITEM also has \"owner\": the"
+    " name, as the transcript or the participants line writes it, of the person who will do it,"
+    " or \"\" when that is not clear. Something done during the meeting is not a next step. An"
     " agreement is something the people explicitly settled together, not one person's statement."
     " A lesson is an insight the people drew. Leave out facts and claims merely mentioned."
     " Fewer, sure items beat many: a list with nothing certain to say is []."
@@ -95,7 +96,8 @@ DRAFT_PROMPT = (
 COMBINE_PROMPT = (
     "Below are the notes of consecutive parts of one meeting, each a JSON object. Merge them"
     " into the notes of the whole meeting: one summary paragraph, and each list without"
-    " duplicates. Write in {language}. Reply with one JSON object and nothing else, with the"
+    " duplicates; a next step starting with a name and a colon keeps them. Write in {language}."
+    " Reply with one JSON object and nothing else, with the"
     ' keys "summary" (string), "next", "agreements" and "lessons" (lists of strings).'
 )
 
@@ -320,6 +322,7 @@ def decide(meta: dict | None, names: set[str]) -> str:
 # --- the work on one recording ---
 
 SPEAKER_LABEL = re.compile(r"^[\w-]{1,40}:[ \t]*", re.M)  # read_transcript's "Neil: ", "SPEAKER_01: "
+UNNAMED = re.compile(r"SPEAKER_\d+$|UNKNOWN$")  # a voice nobody was named for
 
 
 def _plain(text: str) -> str:
@@ -327,7 +330,7 @@ def _plain(text: str) -> str:
     return " ".join(re.findall(r"\w+", text.casefold()))
 
 
-def coerce_draft(obj, source: str | None = None) -> dict:
+def coerce_draft(obj, source: str | None = None, participants: tuple = ()) -> dict:
     """What the applet reads: a summary string and three lists of strings, whatever came back.
 
     With `source`, an item survives only if it carries a quote found in that transcript text:
@@ -337,7 +340,24 @@ def coerce_draft(obj, source: str | None = None) -> dict:
     summary = obj.get("summary")
     out = {"summary": summary.strip()[:SUMMARY_MAX] if isinstance(summary, str) else ""}
     # Speaker labels are not words said: a quote over one speaker's next line skips them.
-    said = _plain(SPEAKER_LABEL.sub("", source)) if source is not None else ""
+    said, starts = "", []  # starts: (offset in said, the line's speaker name or None)
+    for line in (source or "").splitlines():
+        label = SPEAKER_LABEL.match(line)
+        words = _plain(line[label.end():] if label else line)
+        if words:
+            said += (" " if said else "") + words
+            name = label.group(0).rstrip(": \t") if label else ""
+            starts.append((len(said) - len(words), None if UNNAMED.match(name) else name))
+    known = [n for n in dict.fromkeys([s for _, s in starts if s] + list(participants)) if n]
+
+    def owner(i: dict, at: int) -> str | None:
+        """The model's pick if it is a known person (a short "Alex" is "Alexandre"), else the quote's speaker."""
+        pick = i.get("owner").strip().casefold() if isinstance(i.get("owner"), str) else ""
+        for n in known if pick else []:
+            if n.casefold().startswith(pick) or pick.startswith(n.casefold()):
+                return n
+        return next((s for o, s in reversed(starts) if o <= at), None)
+
     for key in ("next", "agreements", "lessons"):
         items = obj.get(key)
         kept = []
@@ -350,6 +370,9 @@ def coerce_draft(obj, source: str | None = None) -> dict:
                 parts = [p for p in map(_plain, re.split(r"\.\.\.|…", quote)) if p]
                 if sum(map(len, parts)) < 8 or not all(p in said for p in parts):
                     continue
+                who = owner(i, said.find(parts[0])) if key == "next" else None
+                if who and not text.strip().casefold().startswith(who.casefold()):
+                    text = f"{who}: {text.strip()}"
             kept.append(text.strip()[:ITEM_MAX])
         out[key] = kept[:ITEMS_MAX]
     return out
@@ -389,7 +412,7 @@ def draft_notes(transcript: str, language: str, door: str, model: str, ask_fn=as
     def asked(system: str, user: str, source: str | None) -> dict:
         for left in range(TRIES - 1, -1, -1):
             try:
-                return coerce_draft(ask_fn(door, model, system, user), source)
+                return coerce_draft(ask_fn(door, model, system, user), source, people)
             except ValueError:  # json.JSONDecodeError included: asked again, the same piece alone
                 if not left:
                     raise
@@ -679,6 +702,19 @@ def selftest() -> None:
         {"text": "label as a word", "quote": "definition neil i m defining"}]}
     d = draft_notes(said, "en", "d", "m", lambda *a: reply)
     assert d["agreements"] == ["over two lines", "with a gap"], d
+    # A next step names who does it: the model's pick when it is a known person, else the
+    # named speaker of its quote; an unnamed voice or an unknown name gives no owner.
+    said = ("Neil: I know what I need to do next, generate the menu.\n"
+            "Neil: Alexandre, can you send the roadmap to me?\nAlexandre: Sure.\n"
+            "SPEAKER_02: I will book the room.")
+    reply = {"summary": "s", "next": [
+        {"text": "Generate the menu", "quote": "what I need to do next, generate the menu"},
+        {"text": "Send the roadmap", "owner": "Alex", "quote": "can you send the roadmap"},
+        {"text": "Book the room", "quote": "I will book the room"},
+        {"text": "Neil: Review it", "owner": "Bob", "quote": "generate the menu"}]}
+    d = draft_notes(said, "en", "d", "m", lambda *a: reply, participants=["Alex", "Neil"])
+    assert d["next"] == ["Neil: Generate the menu", "Alexandre: Send the roadmap", "Book the room",
+                         "Neil: Review it"], d
     # The merge of pieces is not checked again: its input is JSON, not the transcript.
     assert coerce_draft({"next": ["merged", {"text": "obj"}]})["next"] == ["merged", "obj"]
     # A piece whose reply is broken JSON is asked again alone, up to TRIES times, then fails.
