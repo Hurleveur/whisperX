@@ -367,7 +367,8 @@ def coerce_draft(obj, source: str | None = None, participants: tuple = ()) -> di
                 continue
             if source is not None:
                 quote = i.get("quote") if isinstance(i.get("quote"), str) else ""
-                parts = [p for p in map(_plain, re.split(r"\.\.\.|…", quote)) if p]
+                parts = [_plain(SPEAKER_LABEL.sub("", p.strip())) for p in re.split(r"\.\.\.|…", quote)]
+                parts = [p for p in parts if p]
                 if sum(map(len, parts)) < 8 or not all(p in said for p in parts):
                     continue
                 who = owner(i, said.find(parts[0])) if key == "next" else None
@@ -715,6 +716,10 @@ def selftest() -> None:
     d = draft_notes(said, "en", "d", "m", lambda *a: reply, participants=["Alex", "Neil"])
     assert d["next"] == ["Neil: Generate the menu", "Alexandre: Send the roadmap", "Book the room",
                          "Neil: Review it"], d
+    # A quote copied with its line's label, as the model often does, is still found.
+    reply = {"summary": "s", "agreements": [
+        {"text": "Roadmap", "quote": "Neil: Alexandre, can you send ... Alexandre: Sure."}]}
+    assert draft_notes(said, "en", "d", "m", lambda *a: reply)["agreements"] == ["Roadmap"]
     # The merge of pieces is not checked again: its input is JSON, not the transcript.
     assert coerce_draft({"next": ["merged", {"text": "obj"}]})["next"] == ["merged", "obj"]
     # A piece whose reply is broken JSON is asked again alone, up to TRIES times, then fails.
