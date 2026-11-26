@@ -499,8 +499,10 @@ def transcribe(audio: Path, language: str, participants: list | None = None) -> 
     sh = os.environ.get("MEETING_SH") or str(REPO / "scripts/meeting.sh")  # the override is for tests
     asr = asr_name()
     cmd = [sh, "--transcribe-only", str(audio)]
-    if asr == "whisperx" and language in LANGUAGES:
-        cmd += ["--language", language]
+    # Any other language (HyperMeet's "mix", or none) is detected per speech chunk among the
+    # three, so a meeting that switches is not written all in the language of its first 30 s.
+    if asr == "whisperx":
+        cmd += ["--language", language] if language in LANGUAGES else ["--languages", ",".join(LANGUAGES)]
     run = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, "ASR": asr})
     if run.returncode:
         raise RuntimeError(f"meeting.sh failed ({run.returncode}): {run.stderr.strip()[-300:]}")
@@ -796,6 +798,22 @@ def selftest() -> None:
     got = load_creds(tmp / "c.json")
     assert (got["id"], got["secret"], got["issuer"]) == ("pi", "ps", "https://idp.example/"), got
     shutil.rmtree(tmp)
+
+    # The language the phone sent: one of the three is set, anything else ("mix") is detected
+    # per chunk among them. A stand-in meeting.sh records what it was asked.
+    tmp = Path(tempfile.mkdtemp())
+    (tmp / "sh").write_text('#!/bin/sh\necho "$@" > "%s/args"\necho "Neil: hi" > "%s/t.txt"\necho "%s/t.txt"\n' % (tmp, tmp, tmp))
+    (tmp / "sh").chmod(0o755)
+    was, os.environ["MEETING_SH"] = os.environ.get("MEETING_SH"), str(tmp / "sh")
+    real, globals()["asr_name"] = asr_name, lambda: "whisperx"
+    try:
+        for language, want in [("fr", "--language fr"), ("mix", "--languages nl,en,fr"), ("", "--languages nl,en,fr")]:
+            transcribe(tmp / "a.webm", language)
+            assert (tmp / "args").read_text().split(str(tmp / "a.webm"))[1].strip() == want, (language, (tmp / "args").read_text())
+    finally:
+        globals()["asr_name"] = real
+        os.environ.pop("MEETING_SH") if was is None else os.environ.__setitem__("MEETING_SH", was)
+        shutil.rmtree(tmp)
 
     # Speakers: an enrolled voice names its label; one label and one participant left pair up,
     # and that pairing is what gets learned. A stray label (under MIN_SHARE of the lines) does not count.

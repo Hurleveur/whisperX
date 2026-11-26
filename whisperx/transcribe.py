@@ -62,6 +62,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
     max_speakers: int = args.pop("max_speakers")
     diarize_model_name: str = args.pop("diarize_model")
     print_progress: bool = args.pop("print_progress")
+    languages = [c.strip().lower() for c in (args.pop("languages") or "").split(",") if c.strip()]
     return_speaker_embeddings: bool = args.pop("speaker_embeddings")
 
     if return_speaker_embeddings and not diarize:
@@ -154,6 +155,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
             chunk_size=chunk_size,
             print_progress=print_progress,
             verbose=verbose,
+            languages=languages or None,
         )
         results.append((result, audio_path))
 
@@ -187,16 +189,28 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                         result["language"], device, model_dir=model_dir, model_cache_only=model_cache_only
                     )
                 logger.info("Performing alignment...")
-                result: AlignedTranscriptionResult = align(
-                    result["segments"],
-                    align_model,
-                    align_metadata,
-                    input_audio,
-                    device,
-                    interpolate_method=interpolate_method,
-                    return_char_alignments=return_char_alignments,
-                    print_progress=print_progress,
-                )
+                # Chunks heard in different languages (--languages) are aligned each by its own model.
+                spoken = {seg.get("language", result["language"]) for seg in result["segments"]}
+                parts = []
+                for lang in sorted(spoken, key=lambda k: k != align_metadata["language"]):
+                    if lang != align_metadata["language"]:
+                        align_model, align_metadata = load_align_model(
+                            lang, device, model_dir=model_dir, model_cache_only=model_cache_only
+                        )
+                    parts.append(align(
+                        [seg for seg in result["segments"] if seg.get("language", result["language"]) == lang],
+                        align_model,
+                        align_metadata,
+                        input_audio,
+                        device,
+                        interpolate_method=interpolate_method,
+                        return_char_alignments=return_char_alignments,
+                        print_progress=print_progress,
+                    ))
+                result: AlignedTranscriptionResult = {
+                    "segments": sorted((seg for part in parts for seg in part["segments"]), key=lambda seg: seg["start"]),
+                    "word_segments": sorted((w for part in parts for w in part["word_segments"]), key=lambda w: w.get("start", 0)),
+                }
 
             results.append((result, audio_path))
 
